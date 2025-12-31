@@ -51,10 +51,6 @@ The bot uses a multi-layered fill detection system for maximum reliability:
 
 All methods deduplicate via shared HashSet to ensure only one hedge executes per fill.
 
-**Position-Based Detection Cross-Validation:**
-- ✓ **Cross-validated** - Position change detected AND order update received (redundancy working)
-- ⚠ **Not cross-validated** - Position change detected BUT no order update (safety net activated - primary missed it!)
-
 ### Exchange Connectivity
 
 **Pacifica:**
