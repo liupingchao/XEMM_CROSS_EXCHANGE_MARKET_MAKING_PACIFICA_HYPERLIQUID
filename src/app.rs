@@ -32,7 +32,7 @@ use crate::services::{
     spread_recorder::SpreadRecorderService,
     HedgeEvent,
 };
-use crate::strategy::OpportunityEvaluator;
+use crate::strategy::{OpportunityEvaluator, OrderSide};
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
 
 
@@ -645,14 +645,30 @@ impl XemmBot {
                             continue;
                         }
 
+                        // Keep maker orders strictly post-only:
+                        // - BUY price must not cross ask
+                        // - SELL price must not cross bid
+                        // Using current maker TOB gives a conservative, exchange-safe price.
+                        let maker_limit_price = match opp.direction {
+                            OrderSide::Buy => opp.pacifica_price.min(pac_bid),
+                            OrderSide::Sell => opp.pacifica_price.max(pac_ask),
+                        };
+                        let initial_profit_bps = self.evaluator.recalculate_profit_raw(
+                            opp.direction,
+                            maker_limit_price,
+                            hl_bid,
+                            hl_ask,
+                        );
+
                         info!(
-                            "{} {} @ {} → HL {} | Size: {} | Profit: {} | PAC: {}/{} | HL: {}/{}",
+                            "{} {} @ {} (raw:{} ) → HL {} | Size: {} | Profit: {} | PAC: {}/{} | HL: {}/{}",
                             format!("[{} OPPORTUNITY]", symbol_pair).bright_green().bold(),
                             opp.direction.as_str().bright_yellow().bold(),
-                            format!("${:.6}", opp.pacifica_price).cyan().bold(),
+                            format!("${:.6}", maker_limit_price).cyan().bold(),
+                            format!("${:.6}", opp.pacifica_price).bright_black(),
                             format!("${:.6}", opp.hyperliquid_price).cyan(),
                             format!("{:.4}", opp.size).bright_white(),
-                            format!("{:.2} bps", opp.initial_profit_bps).green().bold(),
+                            format!("{:.2} bps", initial_profit_bps).green().bold(),
                             format!("${:.6}", pac_bid).cyan(),
                             format!("${:.6}", pac_ask).cyan(),
                             format!("${:.6}", hl_bid).cyan(),
@@ -673,7 +689,7 @@ impl XemmBot {
                                 &maker_symbol,
                                 maker_side,
                                 opp.size,
-                                opp.pacifica_price,
+                                maker_limit_price,
                                 Some(pac_bid),
                                 Some(pac_ask),
                             )
@@ -702,7 +718,7 @@ impl XemmBot {
                                         "✓".green().bold(),
                                         opp.direction.as_str().bright_yellow(),
                                         order_id,
-                                        format!("${:.4}", opp.pacifica_price).cyan().bold(),
+                                        format!("${:.4}", maker_limit_price).cyan().bold(),
                                         cloid_head,
                                         cloid_tail
                                     );
@@ -714,7 +730,7 @@ impl XemmBot {
                                         self.maker_exchange.name().to_string(),
                                         opp.direction,
                                         opp.size,
-                                        opp.pacifica_price,
+                                        maker_limit_price,
                                         order_data.order_id.clone(),
                                         Some(client_order_id.clone()),
                                         "main_loop_limit_order".to_string(),
@@ -733,9 +749,9 @@ impl XemmBot {
                                         exchange_order_id: order_data.order_id.clone(),
                                         symbol: maker_symbol.clone(),
                                         side: opp.direction,
-                                        price: opp.pacifica_price,
+                                        price: maker_limit_price,
                                         size: opp.size,
-                                        initial_profit_bps: opp.initial_profit_bps,
+                                        initial_profit_bps,
                                         placed_at: Instant::now(),
                                     };
 
@@ -746,9 +762,9 @@ impl XemmBot {
                                     update_order_snapshot(
                                         &self.order_snapshot,
                                         opp.direction,
-                                        opp.pacifica_price,
+                                        maker_limit_price,
                                         opp.size,
-                                        opp.initial_profit_bps,
+                                        initial_profit_bps,
                                     );
                                 } else {
                                     info!("{} {} Order placed but no id returned",
