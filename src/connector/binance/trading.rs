@@ -325,6 +325,54 @@ impl BinanceTrading {
         })
     }
 
+    pub async fn place_market_order(
+        &self,
+        symbol: &str,
+        side: MakerOrderSide,
+        size: f64,
+    ) -> Result<MakerOrderData> {
+        #[derive(Debug, Deserialize)]
+        struct NewOrderResponse {
+            #[serde(rename = "orderId")]
+            order_id: i64,
+            #[serde(rename = "clientOrderId")]
+            client_order_id: String,
+            symbol: String,
+        }
+
+        let symbol_info = self.get_symbol_info(symbol).await?;
+        let rounded_qty = Self::round_down_by_step(size, symbol_info.lot_size);
+        if rounded_qty <= 0.0 {
+            bail!("Rounded Binance market qty is invalid: {}", rounded_qty);
+        }
+
+        let client_id = format!("xemm-mkt-{}", Uuid::new_v4().simple());
+        let side_str = match side {
+            MakerOrderSide::Buy => "BUY",
+            MakerOrderSide::Sell => "SELL",
+        };
+
+        let order: NewOrderResponse = self
+            .signed_request_parse(
+                Method::POST,
+                "/fapi/v1/order",
+                vec![
+                    ("symbol".to_string(), Self::normalize_symbol(symbol)),
+                    ("side".to_string(), side_str.to_string()),
+                    ("type".to_string(), "MARKET".to_string()),
+                    ("quantity".to_string(), Self::decimal_to_string(rounded_qty)),
+                    ("newClientOrderId".to_string(), client_id),
+                ],
+            )
+            .await?;
+
+        Ok(MakerOrderData {
+            order_id: Some(order.order_id.to_string()),
+            client_order_id: Some(order.client_order_id),
+            symbol: Some(order.symbol),
+        })
+    }
+
     pub async fn cancel_all_orders(&self, symbol: Option<&str>) -> Result<u32> {
         let symbol = symbol.context("Binance cancel_all_orders requires symbol")?;
         let before_count = self.get_open_orders(Some(symbol)).await.map(|v| v.len()).unwrap_or(0);
