@@ -19,6 +19,7 @@ use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
 use crate::trade_fetcher;
 use crate::csv_logger;
+use crate::audit_logger;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWrite = futures_util::stream::SplitSink<WsStream, Message>;
@@ -339,11 +340,19 @@ impl HedgeService {
 
                     // Calculate ACTUAL end-to-end latency from fill detection to hedge completion
                     let end_to_end_latency = fill_timestamp.elapsed();
+                    let hedge_side = if is_buy { OrderSide::Buy } else { OrderSide::Sell };
 
                     // Validate and extract order status
-                    let hedge_fill_price = if let Some(status) = response_data.data.statuses.first() {
+                    let hedge_fill_result = if let Some(status) = response_data.data.statuses.first() {
                         match status {
                             crate::connector::hyperliquid::OrderStatus::Filled { filled } => {
+                                let parsed_price = filled.avgPx.parse::<f64>().ok();
+                                let parsed_size = filled
+                                    .totalSz
+                                    .parse::<f64>()
+                                    .ok()
+                                    .filter(|v| *v > 0.0)
+                                    .unwrap_or(size);
                                 info!("{} {} Hedge executed successfully: Filled {} @ ${} | Total latency: {:.1}ms",
                                     format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                     "✓".green().bold(),
@@ -351,7 +360,13 @@ impl HedgeService {
                                     filled.avgPx,
                                     end_to_end_latency.as_secs_f64() * 1000.0
                                 );
-                                filled.avgPx.parse::<f64>().ok()
+                                parsed_price.map(|price| {
+                                    (
+                                        price,
+                                        parsed_size,
+                                        Some(filled.oid.to_string()),
+                                    )
+                                })
                             }
                             crate::connector::hyperliquid::OrderStatus::Error { error } => {
                                 error!("{} {} Hedge order FAILED: {}",
@@ -396,8 +411,8 @@ impl HedgeService {
                     };
 
                     // Validate we got a fill price before continuing
-                    let hedge_fill_price = match hedge_fill_price {
-                        Some(price) => price,
+                    let (hedge_fill_price, hedge_fill_size, hedge_order_id) = match hedge_fill_result {
+                        Some(fill_data) => fill_data,
                         None => {
                             error!("{} {} No hedge fill price available - hedge may have failed",
                                 format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
@@ -413,6 +428,60 @@ impl HedgeService {
                             return;
                         }
                     };
+                    let hedge_is_full_fill = hedge_fill_size + 1e-9 >= size;
+
+                    // Audit logging for hedge side (Hyperliquid): order + fill
+                    let hedge_orders_csv = audit_logger::order_file_for_symbol(&self.hedge_symbol);
+                    let hedge_order_record = audit_logger::OrderRecord::new(
+                        chrono::Utc::now(),
+                        self.hedge_symbol.clone(),
+                        "Hyperliquid".to_string(),
+                        hedge_side,
+                        hedge_fill_size,
+                        hedge_fill_price,
+                        hedge_order_id.clone(),
+                        None,
+                        "hedge_market_order".to_string(),
+                    );
+                    if let Err(e) = audit_logger::log_order(&hedge_orders_csv, &hedge_order_record) {
+                        warn!(
+                            "{} {} Failed to log hedge order to CSV: {}",
+                            format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                            "⚠".yellow().bold(),
+                            e
+                        );
+                    }
+
+                    let hedge_fills_csv = audit_logger::fill_file_for_symbol(&self.hedge_symbol);
+                    let hedge_fill_record = audit_logger::FillRecord::new(
+                        chrono::Utc::now(),
+                        self.hedge_symbol.clone(),
+                        "Hyperliquid".to_string(),
+                        hedge_side,
+                        hedge_fill_size,
+                        hedge_fill_price,
+                        hedge_is_full_fill,
+                        None,
+                        hedge_order_id.clone(),
+                        "hedge_market_fill".to_string(),
+                    );
+                    if let Err(e) = audit_logger::log_fill(&hedge_fills_csv, &hedge_fill_record) {
+                        warn!(
+                            "{} {} Failed to log hedge fill to CSV: {}",
+                            format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                            "⚠".yellow().bold(),
+                            e
+                        );
+                    }
+                    if !hedge_is_full_fill {
+                        warn!(
+                            "{} {} Hedge fill appears partial: expected {:.6}, actual {:.6}",
+                            format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                            "⚠".yellow().bold(),
+                            size,
+                            hedge_fill_size
+                        );
+                    }
 
                     // Get expected profit from active order before marking complete
                     let expected_profit_bps = {
