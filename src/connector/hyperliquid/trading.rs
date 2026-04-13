@@ -5,6 +5,7 @@ use ethers::types::H256;
 use ethers::utils::keccak256;
 use reqwest::Client;
 use serde_json::json;
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -43,7 +44,7 @@ impl HyperliquidCredentials {
         exchange_url: String,
     client: Client,
     wallet: LocalWallet,
-    meta_cache: Arc<RwLock<Option<MetaResponse>>>,
+    meta_cache: Arc<RwLock<HashMap<String, MetaResponse>>>,
     is_testnet: bool,
 }
 
@@ -70,7 +71,7 @@ impl HyperliquidTrading {
             exchange_url,
             client: Client::new(),
             wallet,
-            meta_cache: Arc::new(RwLock::new(None)),
+            meta_cache: Arc::new(RwLock::new(HashMap::new())),
             is_testnet,
         })
     }
@@ -82,22 +83,43 @@ impl HyperliquidTrading {
 
     /// Fetch asset metadata (for asset IDs and szDecimals)
     pub async fn get_meta(&self) -> Result<MetaResponse> {
+        self.get_meta_for_dex(None).await
+    }
+
+    fn dex_from_coin(coin: &str) -> Option<&str> {
+        coin
+            .split_once(':')
+            .map(|(dex, _)| dex)
+            .filter(|dex| !dex.is_empty())
+    }
+
+    async fn get_meta_for_dex(&self, dex: Option<&str>) -> Result<MetaResponse> {
+        let cache_key = dex.unwrap_or("").to_string();
+
         // Check cache first
         {
             let cache = self.meta_cache.read().await;
-            if let Some(cached) = cache.as_ref() {
+            if let Some(cached) = cache.get(&cache_key) {
                 return Ok(cached.clone());
             }
         }
 
-        info!("[HYPERLIQUID] Fetching asset metadata");
+        info!(
+            "[HYPERLIQUID] Fetching asset metadata (dex={})",
+            dex.unwrap_or("default")
+        );
+
+        let mut request_body = json!({
+            "type": "meta"
+        });
+        if let Some(dex_name) = dex {
+            request_body["dex"] = serde_json::Value::String(dex_name.to_string());
+        }
 
         let response = self
             .client
             .post(&self.info_url)
-            .json(&json!({
-                "type": "meta"
-            }))
+            .json(&request_body)
             .send()
             .await
             .context("Failed to fetch meta")?;
@@ -118,7 +140,7 @@ impl HyperliquidTrading {
         // Cache the result
         {
             let mut cache = self.meta_cache.write().await;
-            *cache = Some(meta.clone());
+            cache.insert(cache_key, meta.clone());
         }
 
         debug!("[HYPERLIQUID] Loaded {} assets", meta.universe.len());
@@ -127,7 +149,7 @@ impl HyperliquidTrading {
 
     /// Get asset ID from coin name
     pub async fn get_asset_id(&self, coin: &str) -> Result<u32> {
-        let meta = self.get_meta().await?;
+        let meta = self.get_meta_for_dex(Self::dex_from_coin(coin)).await?;
 
         let asset_index = meta
             .universe
@@ -140,7 +162,7 @@ impl HyperliquidTrading {
 
     /// Get asset metadata (szDecimals, etc.)
     pub async fn get_asset_info(&self, coin: &str) -> Result<AssetMeta> {
-        let meta = self.get_meta().await?;
+        let meta = self.get_meta_for_dex(Self::dex_from_coin(coin)).await?;
 
         meta.universe
             .iter()
@@ -437,6 +459,7 @@ impl HyperliquidTrading {
             nonce,
             signature,
             vaultAddress: None,
+            dex: Self::dex_from_coin(coin).map(str::to_string),
         })
     }
 
