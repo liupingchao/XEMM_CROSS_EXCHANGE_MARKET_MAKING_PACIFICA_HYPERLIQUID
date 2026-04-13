@@ -5,22 +5,22 @@ use tokio::time::interval;
 use tracing::debug;
 
 use crate::connector::hyperliquid::HyperliquidTrading;
-use crate::connector::pacifica::PacificaTrading;
+use crate::connector::maker::MakerExchange;
 
-/// Pacifica REST API polling service
+/// Maker REST API polling service
 ///
 /// Complements WebSocket orderbook by polling REST API periodically.
 /// Provides redundancy if WebSocket connection is lost or delayed.
 /// Updates shared price state at configured interval.
-pub struct PacificaRestPollService {
+pub struct MakerRestPollService {
     pub prices: Arc<Mutex<(f64, f64)>>,
-    pub pacifica_trading: Arc<PacificaTrading>,
+    pub maker_exchange: Arc<dyn MakerExchange>,
     pub symbol: String,
     pub agg_level: u32,
     pub poll_interval_secs: u64,
 }
 
-impl PacificaRestPollService {
+impl MakerRestPollService {
     pub async fn run(self) {
         let mut interval_timer = interval(Duration::from_secs(self.poll_interval_secs));
         interval_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -28,20 +28,32 @@ impl PacificaRestPollService {
         loop {
             interval_timer.tick().await;
 
-            match self.pacifica_trading.get_best_bid_ask_rest(&self.symbol, self.agg_level).await {
+            match self
+                .maker_exchange
+                .get_best_bid_ask_rest(&self.symbol, self.agg_level)
+                .await
+            {
                 Ok(Some((bid, ask))) => {
                     // Update shared orderbook prices
                     *self.prices.lock() = (bid, ask);
                     debug!(
-                        "[PACIFICA_REST] Updated prices via REST: bid=${:.4}, ask=${:.4}",
+                        "[{}_REST] Updated prices via REST: bid=${:.4}, ask=${:.4}",
+                        self.maker_exchange.name().to_uppercase(),
                         bid, ask
                     );
                 }
                 Ok(None) => {
-                    debug!("[PACIFICA_REST] No bid/ask available from REST API");
+                    debug!(
+                        "[{}_REST] No bid/ask available from REST API",
+                        self.maker_exchange.name().to_uppercase()
+                    );
                 }
                 Err(e) => {
-                    debug!("[PACIFICA_REST] Failed to fetch prices: {}", e);
+                    debug!(
+                        "[{}_REST] Failed to fetch prices: {}",
+                        self.maker_exchange.name().to_uppercase(),
+                        e
+                    );
                 }
             }
         }

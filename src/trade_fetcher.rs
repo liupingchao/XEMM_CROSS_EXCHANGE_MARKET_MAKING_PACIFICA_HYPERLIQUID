@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::connector::maker::{MakerExchange, MakerTradeHistoryItem};
 use crate::connector::pacifica::trading::{PacificaTrading, TradeHistoryItem};
 use crate::connector::hyperliquid::trading::HyperliquidTrading;
 use crate::connector::hyperliquid::types::UserFill;
@@ -28,6 +29,141 @@ pub struct ProfitResult {
     pub profit_bps: f64,
     pub pac_fee: f64,
     pub hl_fee: f64,
+}
+
+/// Fetch maker exchange trade history with retry logic.
+///
+/// Matches maker fills by `client_order_id` or `order_id`.
+pub async fn fetch_maker_trade(
+    maker_exchange: Arc<dyn MakerExchange>,
+    symbol: &str,
+    client_order_id: Option<&str>,
+    order_id: Option<&str>,
+    max_attempts: u32,
+    log_fn: impl Fn(&str),
+) -> TradeFetchResult {
+    let mut attempt = 1;
+    let mut result = TradeFetchResult {
+        fill_price: None,
+        actual_fee: None,
+        total_size: None,
+        total_notional: None,
+    };
+
+    while attempt <= max_attempts {
+        log_fn(&format!(
+            "Fetching {} trade history (attempt {}/{})",
+            maker_exchange.name(),
+            attempt,
+            max_attempts
+        ));
+
+        match maker_exchange
+            .get_trade_history(Some(symbol), Some(100), None, None)
+            .await
+        {
+            Ok(trades) => {
+                let matching_trades: Vec<_> = trades
+                    .iter()
+                    .filter(|t| t.is_maker_fill)
+                    .filter(|t| {
+                        let client_match = client_order_id
+                            .map(|id| t.client_order_id.as_deref() == Some(id))
+                            .unwrap_or(false);
+                        let order_match = order_id
+                            .map(|id| t.order_id.as_deref() == Some(id))
+                            .unwrap_or(false);
+                        client_match || order_match
+                    })
+                    .collect();
+
+                if !matching_trades.is_empty() {
+                    log_fn(&format!(
+                        "✓ Found {} matching {} maker trade(s)",
+                        matching_trades.len(),
+                        maker_exchange.name()
+                    ));
+                    result = calculate_maker_trade_result(&matching_trades);
+                    break;
+                } else {
+                    log_fn(&format!(
+                        "⚠ No matching {} maker trades found yet",
+                        maker_exchange.name()
+                    ));
+                    if attempt < max_attempts {
+                        log_fn("Waiting 10 seconds before retry...");
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                    }
+                }
+            }
+            Err(e) => {
+                log_fn(&format!(
+                    "✗ Failed to fetch {} trade history: {}",
+                    maker_exchange.name(),
+                    e
+                ));
+                if attempt < max_attempts {
+                    log_fn("Waiting 10 seconds before retry...");
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                }
+            }
+        }
+
+        attempt += 1;
+    }
+
+    result
+}
+
+pub fn calculate_maker_trade_result(trades: &[&MakerTradeHistoryItem]) -> TradeFetchResult {
+    if trades.len() == 1 {
+        let price = Some(trades[0].entry_price);
+        let size = Some(trades[0].amount);
+        let notional = match (price, size) {
+            (Some(p), Some(s)) => Some(p * s),
+            _ => None,
+        };
+
+        TradeFetchResult {
+            fill_price: price,
+            actual_fee: Some(trades[0].fee),
+            total_size: size,
+            total_notional: notional,
+        }
+    } else {
+        let mut total_notional = 0.0;
+        let mut total_size = 0.0;
+        let mut total_fee = 0.0;
+
+        for trade in trades {
+            total_notional += trade.entry_price * trade.amount;
+            total_size += trade.amount;
+            total_fee += trade.fee;
+        }
+
+        TradeFetchResult {
+            fill_price: if total_size > 0.0 {
+                Some(total_notional / total_size)
+            } else {
+                None
+            },
+            actual_fee: if total_size > 0.0 {
+                Some(total_fee)
+            } else {
+                None
+            },
+            total_size: if total_size > 0.0 {
+                Some(total_size)
+            } else {
+                None
+            },
+            total_notional: if total_notional > 0.0 {
+                Some(total_notional)
+            } else {
+                None
+            },
+        }
+    }
 }
 
 /// Calculate profit from hedge trade using actual notional values

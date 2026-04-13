@@ -8,9 +8,9 @@ use std::time::Instant;
 pub enum BotStatus {
     /// Bot is idle, waiting for an opportunity
     Idle,
-    /// Order has been placed on Pacifica
+    /// Order has been placed on maker exchange
     OrderPlaced,
-    /// Order has been filled on Pacifica
+    /// Order has been filled on maker exchange
     Filled,
     /// Hedge is being executed on Hyperliquid
     Hedging,
@@ -25,6 +25,8 @@ pub enum BotStatus {
 pub struct ActiveOrder {
     /// Client order ID
     pub client_order_id: String,
+    /// Exchange-native order ID if available
+    pub exchange_order_id: Option<String>,
     /// Trading symbol (e.g., "SOL")
     pub symbol: String,
     /// Order side (Buy or Sell)

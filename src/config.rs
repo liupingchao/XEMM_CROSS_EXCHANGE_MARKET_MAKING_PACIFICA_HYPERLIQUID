@@ -6,6 +6,10 @@ use std::path::Path;
 /// Application configuration loaded from config.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    /// Maker exchange backend ("pacifica" or "binance")
+    #[serde(default = "default_maker_exchange")]
+    pub maker_exchange: String,
+
     /// Trading symbol (e.g., "SOL", "BTC", "ETH")
     pub symbol: String,
 
@@ -73,6 +77,10 @@ fn default_agg_level() -> u32 {
     1
 }
 
+fn default_maker_exchange() -> String {
+    "pacifica".to_string()
+}
+
 fn default_reconnect_attempts() -> u32 {
     5
 }
@@ -128,6 +136,7 @@ fn default_pacifica_active_order_rest_poll_interval() -> u64 {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            maker_exchange: default_maker_exchange(),
             symbol: "SOL".to_string(),
             agg_level: default_agg_level(),
             reconnect_attempts: default_reconnect_attempts(),
@@ -182,6 +191,14 @@ impl Config {
         // Check symbol is not empty
         anyhow::ensure!(!self.symbol.is_empty(), "Symbol cannot be empty");
 
+        // Check maker exchange value
+        let maker = self.maker_exchange.to_ascii_lowercase();
+        anyhow::ensure!(
+            maker == "pacifica" || maker == "binance",
+            "Invalid maker_exchange: {}. Must be one of: pacifica, binance",
+            self.maker_exchange
+        );
+
         // Check aggregation level is valid
         let valid_agg_levels = [1, 2, 5, 10, 100, 1000];
         anyhow::ensure!(
@@ -213,6 +230,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
+        assert_eq!(config.maker_exchange, "pacifica");
         assert_eq!(config.symbol, "SOL");
         assert_eq!(config.agg_level, 1);
         assert_eq!(config.reconnect_attempts, 5);

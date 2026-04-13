@@ -8,23 +8,28 @@ use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::bot::{ActiveOrder, BotState, BotStatus};
 use crate::config::Config;
+use crate::connector::binance::{BinanceCredentials, BinanceTrading};
 use crate::connector::hyperliquid::{HyperliquidCredentials, HyperliquidTrading};
+use crate::connector::maker::{
+    BinanceMakerExchange, MakerExchange, MakerExchangeKind, MakerOrderSide, PacificaMakerExchange,
+};
 use crate::connector::pacifica::{
     FillDetectionClient, FillDetectionConfig, PacificaCredentials, PacificaTrading,
-    PacificaWsTrading, OrderSide as PacificaOrderSide,
+    PacificaWsTrading,
 };
 use crate::services::{
+    binance_fill_detection::BinanceFillDetectionService,
     fill_detection::FillDetectionService, hedge::HedgeService,
     order_monitor::{AtomicBotStatus, OrderMonitorService, SharedOrderSnapshot, spawn_monitor_tasks, sync_atomic_status, update_order_snapshot},
     orderbook::{HyperliquidOrderbookService, PacificaOrderbookService},
     position_monitor::PositionMonitorService, rest_fill_detection::RestFillDetectionService,
-    rest_poll::{HyperliquidRestPollService, PacificaRestPollService}, HedgeEvent,
+    rest_poll::{HyperliquidRestPollService, MakerRestPollService}, HedgeEvent,
 };
-use crate::strategy::{OpportunityEvaluator, OrderSide};
+use crate::strategy::OpportunityEvaluator;
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
 
 
@@ -42,14 +47,13 @@ pub struct XemmBot {
     pub config: Config,
     pub bot_state: Arc<RwLock<BotState>>,
 
-    // Trading clients (each task gets its own instance to avoid lock contention)
-    pub pacifica_trading_main: Arc<PacificaTrading>,
-    pub pacifica_trading_fill: Arc<PacificaTrading>,
-    pub pacifica_trading_rest_fill: Arc<PacificaTrading>,
-    pub pacifica_trading_monitor: Arc<PacificaTrading>,
-    pub pacifica_trading_hedge: Arc<PacificaTrading>,
-    pub pacifica_trading_rest_poll: Arc<PacificaTrading>,
-    pub pacifica_ws_trading: Arc<PacificaWsTrading>,
+    // Maker exchange backend (abstraction for Pacifica/Binance/...)
+    pub maker_kind: MakerExchangeKind,
+    pub maker_exchange: Arc<dyn MakerExchange>,
+
+    // Optional Pacifica-specific clients (used only when maker = Pacifica)
+    pub pacifica_trading_fill: Option<Arc<PacificaTrading>>,
+    pub pacifica_ws_trading: Option<Arc<PacificaWsTrading>>,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
 
     // Shared state (prices)
@@ -73,8 +77,8 @@ pub struct XemmBot {
     pub shutdown_tx: mpsc::Sender<()>,
     pub shutdown_rx: Option<mpsc::Receiver<()>>,
 
-    // Credentials (needed for spawning services)
-    pub pacifica_credentials: PacificaCredentials,
+    // Credentials (needed for spawning Pacifica-only services)
+    pub pacifica_credentials: Option<PacificaCredentials>,
 }
 
 impl XemmBot {
@@ -86,7 +90,7 @@ impl XemmBot {
     /// - Creates all trading clients
     /// - Pre-fetches Hyperliquid metadata
     /// - Cancels existing orders
-    /// - Fetches Pacifica tick size
+    /// - Fetches maker tick size
     /// - Creates OpportunityEvaluator
     /// - Initializes shared state and channels
     pub async fn new() -> Result<Self> {
@@ -154,53 +158,69 @@ impl XemmBot {
 
         // Load credentials
         dotenv::dotenv().ok();
-        let pacifica_credentials =
-            PacificaCredentials::from_env().context("Failed to load Pacifica credentials from environment")?;
         let hyperliquid_credentials =
             HyperliquidCredentials::from_env().context("Failed to load Hyperliquid credentials from environment")?;
 
-        info!("{} {}",
-            "[INIT]".cyan().bold(),
-            "Credentials loaded successfully".green()
-        );
-
-        // Initialize trading clients
-        let pacifica_trading_main = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create main Pacifica trading client")?,
-        );
-        let pacifica_trading_fill = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create fill detection Pacifica trading client")?,
-        );
-        let pacifica_trading_rest_fill = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create REST fill detection Pacifica trading client")?,
-        );
-        let pacifica_trading_monitor = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create monitor Pacifica trading client")?,
-        );
-        let pacifica_trading_hedge = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create hedge Pacifica trading client")?,
-        );
-        let pacifica_trading_rest_poll = Arc::new(
-            PacificaTrading::new(pacifica_credentials.clone())
-                .context("Failed to create REST polling Pacifica trading client")?,
-        );
-
-        // Initialize WebSocket trading client for ultra-fast cancellations
-        let pacifica_ws_trading = Arc::new(PacificaWsTrading::new(pacifica_credentials.clone(), false)); // false = mainnet
+        let maker_name = config.maker_exchange.to_ascii_lowercase();
+        let (maker_kind, maker_exchange, pacifica_trading_fill, pacifica_ws_trading, pacifica_credentials): (
+            MakerExchangeKind,
+            Arc<dyn MakerExchange>,
+            Option<Arc<PacificaTrading>>,
+            Option<Arc<PacificaWsTrading>>,
+            Option<PacificaCredentials>,
+        ) = match maker_name.as_str() {
+            "pacifica" => {
+                let creds = PacificaCredentials::from_env()
+                    .context("Failed to load Pacifica credentials from environment")?;
+                let pacifica_trading_main = Arc::new(
+                    PacificaTrading::new(creds.clone())
+                        .context("Failed to create Pacifica trading client")?,
+                );
+                let pacifica_trading_fill = Arc::new(
+                    PacificaTrading::new(creds.clone())
+                        .context("Failed to create Pacifica fill trading client")?,
+                );
+                let maker_exchange: Arc<dyn MakerExchange> =
+                    Arc::new(PacificaMakerExchange::new(pacifica_trading_main));
+                let ws = Arc::new(PacificaWsTrading::new(creds.clone(), false));
+                (
+                    MakerExchangeKind::Pacifica,
+                    maker_exchange,
+                    Some(pacifica_trading_fill),
+                    Some(ws),
+                    Some(creds),
+                )
+            }
+            "binance" => {
+                let creds = BinanceCredentials::from_env()
+                    .context("Failed to load Binance credentials from environment")?;
+                let binance_trading = Arc::new(
+                    BinanceTrading::new(creds, false)
+                        .context("Failed to create Binance trading client")?,
+                );
+                let maker_exchange: Arc<dyn MakerExchange> =
+                    Arc::new(BinanceMakerExchange::new(binance_trading));
+                (
+                    MakerExchangeKind::Binance,
+                    maker_exchange,
+                    None,
+                    None,
+                    None,
+                )
+            }
+            _ => unreachable!("config.validate() already ensures valid maker_exchange"),
+        };
 
         let hyperliquid_trading = Arc::new(
             HyperliquidTrading::new(hyperliquid_credentials, false)
                 .context("Failed to create Hyperliquid trading client")?,
         );
 
-        info!("{} {}",
+        info!(
+            "{} {} Maker={} / Hedge=Hyperliquid",
             "[INIT]".cyan().bold(),
-            "Trading clients initialized (6 REST instances + WebSocket)".green()
+            "Trading clients initialized.".green(),
+            maker_exchange.name().bright_white().bold(),
         );
 
         // Pre-fetch Hyperliquid metadata (szDecimals, etc.) to reduce hedge latency
@@ -217,14 +237,12 @@ impl XemmBot {
             "✓".green().bold()
         );
 
-        // Cancel any existing orders on Pacifica at startup
-        info!("{} Cancelling any existing orders on Pacifica...",
-            "[INIT]".cyan().bold()
+        // Cancel any existing orders on maker exchange at startup
+        info!("{} Cancelling any existing orders on {}...",
+            "[INIT]".cyan().bold(),
+            maker_exchange.name()
         );
-        match pacifica_trading_main
-            .cancel_all_orders(false, Some(&config.symbol), false)
-            .await
-        {
+        match maker_exchange.cancel_all_orders(Some(&config.symbol)).await {
             Ok(count) => info!("{} {} Cancelled {} existing order(s)",
                 "[INIT]".cyan().bold(),
                 "✓".green().bold(),
@@ -237,22 +255,18 @@ impl XemmBot {
             ),
         }
 
-        // Get market info to determine tick size
-        let pacifica_tick_size: f64 = {
-            let market_info = pacifica_trading_main
-                .get_market_info()
-                .await
-                .context("Failed to fetch Pacifica market info")?;
-            let symbol_info = market_info
-                .get(&config.symbol)
-                .with_context(|| format!("Symbol {} not found in market info", config.symbol))?;
-            symbol_info.tick_size.parse().context("Failed to parse tick size")?
-        };
+        // Get maker symbol info to determine tick size
+        let maker_symbol_info = maker_exchange
+            .get_symbol_info(&config.symbol)
+            .await
+            .with_context(|| format!("Failed to fetch {} symbol info", maker_exchange.name()))?;
+        let maker_tick_size = maker_symbol_info.tick_size;
 
-        info!("{} Pacifica tick size for {}: {}",
+        info!("{} {} tick size for {}: {}",
             "[INIT]".cyan().bold(),
+            maker_exchange.name(),
             config.symbol.bright_white(),
-            format!("{}", pacifica_tick_size).bright_white()
+            format!("{}", maker_tick_size).bright_white()
         );
 
         // Create opportunity evaluator
@@ -260,7 +274,7 @@ impl XemmBot {
             config.pacifica_maker_fee_bps,
             config.hyperliquid_taker_fee_bps,
             config.profit_rate_bps,
-            pacifica_tick_size,
+            maker_tick_size,
         );
 
         info!("{} {}",
@@ -298,12 +312,9 @@ impl XemmBot {
         Ok(XemmBot {
             config,
             bot_state,
-            pacifica_trading_main,
+            maker_kind,
+            maker_exchange,
             pacifica_trading_fill,
-            pacifica_trading_rest_fill,
-            pacifica_trading_monitor,
-            pacifica_trading_hedge,
-            pacifica_trading_rest_poll,
             pacifica_ws_trading,
             hyperliquid_trading,
             pacifica_prices,
@@ -327,17 +338,25 @@ impl XemmBot {
         // SPAWN ALL SERVICES
         // ═══════════════════════════════════════════════════
 
-        // Service 1: Pacifica Orderbook (WebSocket)
-        let pacifica_ob_service = PacificaOrderbookService {
-            prices: self.pacifica_prices.clone(),
-            symbol: self.config.symbol.clone(),
-            agg_level: self.config.agg_level,
-            reconnect_attempts: self.config.reconnect_attempts,
-            ping_interval_secs: self.config.ping_interval_secs,
-        };
-        tokio::spawn(async move {
-            pacifica_ob_service.run().await.ok();
-        });
+        // Service 1: Maker orderbook WebSocket (Pacifica only for now)
+        if matches!(self.maker_kind, MakerExchangeKind::Pacifica) {
+            let pacifica_ob_service = PacificaOrderbookService {
+                prices: self.pacifica_prices.clone(),
+                symbol: self.config.symbol.clone(),
+                agg_level: self.config.agg_level,
+                reconnect_attempts: self.config.reconnect_attempts,
+                ping_interval_secs: self.config.ping_interval_secs,
+            };
+            tokio::spawn(async move {
+                pacifica_ob_service.run().await.ok();
+            });
+        } else {
+            info!(
+                "{} Using REST polling for maker orderbook ({})",
+                "[INIT]".cyan().bold(),
+                self.maker_exchange.name()
+            );
+        }
 
         // Service 2: Hyperliquid Orderbook (WebSocket)
         let hyperliquid_ob_service = HyperliquidOrderbookService {
@@ -349,42 +368,65 @@ impl XemmBot {
         tokio::spawn(async move {
             hyperliquid_ob_service.run().await.ok();
         });
-        let fill_config = FillDetectionConfig {
-            account: self.pacifica_credentials.account.clone(),
-            reconnect_attempts: self.config.reconnect_attempts,
-            ping_interval_secs: self.config.ping_interval_secs,
-            enable_position_fill_detection: true,
-        };
-        let fill_client = FillDetectionClient::new(fill_config.clone(), false)
-            .context("Failed to create fill detection client")?;
-        let baseline_updater = fill_client.get_baseline_updater();
+        // Service 3: Pacifica WebSocket fill detection (only when maker = Pacifica)
+        if let (MakerExchangeKind::Pacifica, Some(pac_creds), Some(pac_trading_fill), Some(pac_ws)) = (
+            self.maker_kind,
+            self.pacifica_credentials.clone(),
+            self.pacifica_trading_fill.clone(),
+            self.pacifica_ws_trading.clone(),
+        ) {
+            let fill_config = FillDetectionConfig {
+                account: pac_creds.account,
+                reconnect_attempts: self.config.reconnect_attempts,
+                ping_interval_secs: self.config.ping_interval_secs,
+                enable_position_fill_detection: true,
+            };
+            let fill_client = FillDetectionClient::new(fill_config.clone(), false)
+                .context("Failed to create fill detection client")?;
+            let baseline_updater = fill_client.get_baseline_updater();
 
-        let fill_service = FillDetectionService {
-            bot_state: self.bot_state.clone(),
-            hedge_tx: self.hedge_tx.clone(),
-            pacifica_trading: self.pacifica_trading_fill.clone(),
-            pacifica_ws_trading: self.pacifica_ws_trading.clone(),
-            fill_config,
-            symbol: self.config.symbol.clone(),
-            processed_fills: self.processed_fills.clone(),
-            baseline_updater,
-            atomic_status: self.atomic_status.clone(),
-            order_snapshot: self.order_snapshot.clone(),
-        };
-        tokio::spawn(async move {
-            fill_service.run().await;
-        });
+            let fill_service = FillDetectionService {
+                bot_state: self.bot_state.clone(),
+                hedge_tx: self.hedge_tx.clone(),
+                pacifica_trading: pac_trading_fill,
+                pacifica_ws_trading: pac_ws,
+                fill_config,
+                symbol: self.config.symbol.clone(),
+                processed_fills: self.processed_fills.clone(),
+                baseline_updater,
+                atomic_status: self.atomic_status.clone(),
+                order_snapshot: self.order_snapshot.clone(),
+            };
+            tokio::spawn(async move {
+                fill_service.run().await;
+            });
+        }
+        if matches!(self.maker_kind, MakerExchangeKind::Binance) {
+            let binance_fill_service = BinanceFillDetectionService {
+                bot_state: self.bot_state.clone(),
+                hedge_tx: self.hedge_tx.clone(),
+                maker_exchange: self.maker_exchange.clone(),
+                symbol: self.config.symbol.clone(),
+                processed_fills: self.processed_fills.clone(),
+                reconnect_attempts: self.config.reconnect_attempts,
+                ping_interval_secs: self.config.ping_interval_secs,
+                min_hedge_notional: 10.0,
+            };
+            tokio::spawn(async move {
+                binance_fill_service.run().await;
+            });
+        }
 
-        // Service 4: Pacifica REST Poll (price redundancy)
-        let pacifica_rest_poll_service = PacificaRestPollService {
+        // Service 4: Maker REST Poll (price redundancy)
+        let maker_rest_poll_service = MakerRestPollService {
             prices: self.pacifica_prices.clone(),
-            pacifica_trading: self.pacifica_trading_rest_poll.clone(),
+            maker_exchange: self.maker_exchange.clone(),
             symbol: self.config.symbol.clone(),
             agg_level: self.config.agg_level,
             poll_interval_secs: self.config.pacifica_rest_poll_interval_secs,
         };
         tokio::spawn(async move {
-            pacifica_rest_poll_service.run().await;
+            maker_rest_poll_service.run().await;
         });
 
         // Service 4.5: Hyperliquid REST Poll (price redundancy)
@@ -406,8 +448,7 @@ impl XemmBot {
         let rest_fill_service = RestFillDetectionService {
             bot_state: self.bot_state.clone(),
             hedge_tx: self.hedge_tx.clone(),
-            pacifica_trading: self.pacifica_trading_rest_fill.clone(),
-            pacifica_ws_trading: self.pacifica_ws_trading.clone(),
+            maker_exchange: self.maker_exchange.clone(),
             symbol: self.config.symbol.clone(),
             processed_fills: self.processed_fills.clone(),
             min_hedge_notional: 10.0,
@@ -418,24 +459,26 @@ impl XemmBot {
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Service 5.5: Position Monitor (ground truth)
-        let pacifica_trading_position = Arc::new(
-            PacificaTrading::new(self.pacifica_credentials.clone())
-                .context("Failed to create position monitor trading client")?
-        );
-        let position_monitor_service = PositionMonitorService {
-            bot_state: self.bot_state.clone(),
-            hedge_tx: self.hedge_tx.clone(),
-            pacifica_trading: pacifica_trading_position,
-            pacifica_ws_trading: self.pacifica_ws_trading.clone(),
-            symbol: self.config.symbol.clone(),
-            processed_fills: self.processed_fills.clone(),
-            last_position_snapshot: self.last_position_snapshot.clone(),
-        };
-        tokio::spawn(async move {
-            position_monitor_service.run().await;
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Service 5.5: Pacifica position monitor (ground truth, Pacifica only)
+        if let (MakerExchangeKind::Pacifica, Some(pac_trading), Some(pac_ws)) = (
+            self.maker_kind,
+            self.pacifica_trading_fill.clone(),
+            self.pacifica_ws_trading.clone(),
+        ) {
+            let position_monitor_service = PositionMonitorService {
+                bot_state: self.bot_state.clone(),
+                hedge_tx: self.hedge_tx.clone(),
+                pacifica_trading: pac_trading,
+                pacifica_ws_trading: pac_ws,
+                symbol: self.config.symbol.clone(),
+                processed_fills: self.processed_fills.clone(),
+                last_position_snapshot: self.last_position_snapshot.clone(),
+            };
+            tokio::spawn(async move {
+                position_monitor_service.run().await;
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
 
         // Service 6: Order Monitor (age/profit monitoring)
         let (order_monitor_service, cancel_rx) = OrderMonitorService::new(
@@ -446,7 +489,7 @@ impl XemmBot {
             self.hyperliquid_prices.clone(),
             self.config.clone(),
             self.evaluator.clone(),
-            self.pacifica_trading_monitor.clone(),
+            self.maker_exchange.clone(),
             self.hyperliquid_trading.clone(),
         );
         let order_monitor_service = Arc::new(order_monitor_service);
@@ -459,7 +502,7 @@ impl XemmBot {
             hyperliquid_prices: self.hyperliquid_prices.clone(),
             config: self.config.clone(),
             hyperliquid_trading: self.hyperliquid_trading.clone(),
-            pacifica_trading: self.pacifica_trading_hedge.clone(),
+            maker_exchange: self.maker_exchange.clone(),
             shutdown_tx: self.shutdown_tx.clone(),
         };
         tokio::spawn(async move {
@@ -585,23 +628,20 @@ impl XemmBot {
                         );
 
                         // Place order
-                        info!("{} Placing {} on Pacifica...",
+                        info!("{} Placing {} on {}...",
                             format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
-                            opp.direction.as_str().bright_yellow().bold()
+                            opp.direction.as_str().bright_yellow().bold(),
+                            self.maker_exchange.name()
                         );
 
-                        let pacifica_side = match opp.direction {
-                            OrderSide::Buy => PacificaOrderSide::Buy,
-                            OrderSide::Sell => PacificaOrderSide::Sell,
-                        };
+                        let maker_side = MakerOrderSide::from_strategy_side(opp.direction);
 
-                        match self.pacifica_trading_main
+                        match self.maker_exchange
                             .place_limit_order(
                                 &self.config.symbol,
-                                pacifica_side,
+                                maker_side,
                                 opp.size,
-                                Some(opp.pacifica_price),
-                                0.0,
+                                opp.pacifica_price,
                                 Some(pac_bid),
                                 Some(pac_ask),
                             )
@@ -610,8 +650,20 @@ impl XemmBot {
                             Ok(order_data) => {
                                 order_placement_rate_limit.record_success();
 
-                                if let Some(client_order_id) = order_data.client_order_id {
-                                    let order_id = order_data.order_id.unwrap_or(0);
+                                let client_order_id = order_data
+                                    .client_order_id
+                                    .clone()
+                                    .or_else(|| order_data.order_id.clone());
+
+                                if let Some(client_order_id) = client_order_id {
+                                    let order_id = order_data.order_id.clone().unwrap_or_else(|| "-".to_string());
+                                    let cloid_head = client_order_id.chars().take(8).collect::<String>();
+                                    let cloid_tail = {
+                                        let chars: Vec<char> = client_order_id.chars().collect();
+                                        let n = chars.len();
+                                        let start = n.saturating_sub(4);
+                                        chars[start..n].iter().collect::<String>()
+                                    };
                                     info!(
                                         "{} {} Placed {} #{} @ {} | cloid: {}...{}",
                                         format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
@@ -619,12 +671,13 @@ impl XemmBot {
                                         opp.direction.as_str().bright_yellow(),
                                         order_id,
                                         format!("${:.4}", opp.pacifica_price).cyan().bold(),
-                                        &client_order_id[..8],
-                                        &client_order_id[client_order_id.len()-4..]
+                                        cloid_head,
+                                        cloid_tail
                                     );
 
                                     let active_order = ActiveOrder {
                                         client_order_id,
+                                        exchange_order_id: order_data.order_id.clone(),
                                         symbol: self.config.symbol.clone(),
                                         side: opp.direction,
                                         price: opp.pacifica_price,
@@ -645,7 +698,7 @@ impl XemmBot {
                                         opp.initial_profit_bps,
                                     );
                                 } else {
-                                    info!("{} {} Order placed but no client_order_id returned",
+                                    info!("{} {} Order placed but no id returned",
                                         format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
                                         "✗".red().bold()
                                     );
@@ -692,7 +745,7 @@ impl XemmBot {
             format!("[{} SHUTDOWN]", self.config.symbol).yellow().bold()
         );
 
-        match self.pacifica_trading_main.cancel_all_orders(false, Some(&self.config.symbol), false).await {
+        match self.maker_exchange.cancel_all_orders(Some(&self.config.symbol)).await {
             Ok(count) => info!("{} {} Cancelled {} order(s)",
                 format!("[{} SHUTDOWN]", self.config.symbol).yellow().bold(),
                 "✓".green().bold(),

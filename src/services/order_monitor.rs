@@ -9,7 +9,7 @@ use tracing::{debug, info, warn};
 use crate::bot::{BotState, BotStatus};
 use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
-use crate::connector::pacifica::PacificaTrading;
+use crate::connector::maker::MakerExchange;
 use crate::strategy::{OpportunityEvaluator, OrderSide};
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
 
@@ -127,7 +127,7 @@ pub struct OrderMonitorService {
     pub evaluator: OpportunityEvaluator,
     
     // Trading connectors (only used by cancellation task)
-    pub pacifica_trading: Arc<PacificaTrading>,
+    pub maker_exchange: Arc<dyn MakerExchange>,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
     
     // Channel for cancel requests (decouples hot path from I/O)
@@ -144,7 +144,7 @@ impl OrderMonitorService {
         hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
         config: Config,
         evaluator: OpportunityEvaluator,
-        pacifica_trading: Arc<PacificaTrading>,
+        maker_exchange: Arc<dyn MakerExchange>,
         hyperliquid_trading: Arc<HyperliquidTrading>,
     ) -> (Self, mpsc::Receiver<CancelRequest>) {
         // Bounded channel to prevent unbounded growth, but large enough to not block
@@ -158,7 +158,7 @@ impl OrderMonitorService {
             hyperliquid_prices,
             config,
             evaluator,
-            pacifica_trading,
+            maker_exchange,
             hyperliquid_trading,
             cancel_tx,
         };
@@ -303,7 +303,7 @@ impl OrderMonitorService {
                 CancelRequest::ProfitDeviation { symbol, .. } => symbol,
             };
 
-            match self.pacifica_trading.cancel_all_orders(false, Some(symbol), false).await {
+            match self.maker_exchange.cancel_all_orders(Some(symbol)).await {
                 Ok(_) => {
                     rate_limit.record_success();
                     
@@ -394,10 +394,10 @@ impl OrderMonitorService {
         };
         drop(state);
 
-        match self.pacifica_trading.get_open_orders().await {
+        match self.maker_exchange.get_open_orders(Some(&self.config.symbol)).await {
             Ok(orders) => {
                 if let Some(order) = orders.iter().find(|o| o.client_order_id == client_order_id) {
-                    let filled_amount: f64 = fast_float::parse(&order.filled_amount).unwrap_or(0.0);
+                    let filled_amount = order.filled_amount;
                     if filled_amount > 0.0 {
                         FillCheckResult::HasFills(filled_amount)
                     } else {
@@ -413,7 +413,7 @@ impl OrderMonitorService {
 
     /// Refresh prices from both exchanges in parallel
     async fn refresh_prices_parallel(&self) {
-        let pac_future = self.pacifica_trading.get_best_bid_ask_rest(
+        let pac_future = self.maker_exchange.get_best_bid_ask_rest(
             &self.config.symbol,
             self.config.agg_level,
         );
@@ -423,7 +423,12 @@ impl OrderMonitorService {
 
         if let Ok(Some((bid, ask))) = pac_result {
             *self.pacifica_prices.lock() = (bid, ask);
-            debug!("[REFRESH] Pacifica: bid=${:.6}, ask=${:.6}", bid, ask);
+            debug!(
+                "[REFRESH] {}: bid=${:.6}, ask=${:.6}",
+                self.maker_exchange.name(),
+                bid,
+                ask
+            );
         }
 
         if let Ok(Some((bid, ask))) = hl_result {

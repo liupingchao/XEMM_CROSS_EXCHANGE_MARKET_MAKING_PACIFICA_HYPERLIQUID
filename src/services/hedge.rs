@@ -14,7 +14,7 @@ use crate::bot::BotState;
 use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
 use crate::connector::hyperliquid::types::{WsPostRequest, WsPostRequestInner, WsPostResponse};
-use crate::connector::pacifica::PacificaTrading;
+use crate::connector::maker::MakerExchange;
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
 use crate::trade_fetcher;
@@ -29,14 +29,14 @@ type WsRead = futures_util::stream::SplitStream<WsStream>;
 /// Hedge execution service
 ///
 /// Receives hedge triggers via mpsc channel and executes the hedge flow:
-/// 1. Pre-hedge cancellation of all Pacifica orders
+/// 1. Pre-hedge cancellation of all maker orders
 /// 2. Execute market order on Hyperliquid (opposite direction)
 /// 3. Wait for trade propagation (20s)
 /// 4. Fetch trade history from both exchanges
 /// 5. Calculate actual profit using real fill data and fees
 /// 6. Display comprehensive trade summary
 /// 7. Post-hedge cancellation (safety)
-/// 8. Position verification on both exchanges
+/// 8. Position verification on maker + hedge exchanges
 /// 9. Mark cycle complete and signal shutdown
 pub struct HedgeService {
     pub bot_state: Arc<RwLock<BotState>>,
@@ -44,7 +44,7 @@ pub struct HedgeService {
     pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
     pub config: Config,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
-    pub pacifica_trading: Arc<PacificaTrading>,
+    pub maker_exchange: Arc<dyn MakerExchange>,
     pub shutdown_tx: mpsc::Sender<()>,
 }
 
@@ -114,18 +114,16 @@ impl HedgeService {
             // Extra safety: cancel again in case fill detection missed anything
             // or there was a race condition.
             // MOVED TO BACKGROUND TASK to avoid blocking hedge execution latency.
-            let pacifica_trading_bg = self.pacifica_trading.clone();
+            let maker_exchange_bg = self.maker_exchange.clone();
             let symbol_bg = self.config.symbol.clone();
 
             tokio::spawn(async move {
-                info!("{} {} Pre-hedge safety: Cancelling all Pacifica orders (background)...",
+                info!("{} {} Pre-hedge safety: Cancelling maker orders (background)...",
                     format!("[{} HEDGE]", symbol_bg).bright_magenta().bold(),
                     "⚡".yellow().bold()
                 );
 
-                if let Err(e) = pacifica_trading_bg
-                    .cancel_all_orders(false, Some(&symbol_bg), false)
-                    .await
+                if let Err(e) = maker_exchange_bg.cancel_all_orders(Some(&symbol_bg)).await
                 {
                     warn!("{} {} Failed to cancel orders before hedge: {}",
                         format!("[{} HEDGE]", symbol_bg).bright_magenta().bold(),
@@ -426,30 +424,37 @@ impl HedgeService {
                     );
                     tokio::time::sleep(Duration::from_secs(20)).await;
 
-                    // Get client_order_id from bot state
-                    let client_order_id = {
+                    // Get maker order ids from bot state
+                    let (client_order_id, maker_order_id) = {
                         let state = self.bot_state.read().await;
-                        state.active_order.as_ref().map(|o| o.client_order_id.clone())
+                        (
+                            state.active_order.as_ref().map(|o| o.client_order_id.clone()),
+                            state.active_order.as_ref().and_then(|o| o.exchange_order_id.clone()),
+                        )
                     };
 
-                    // Fetch Pacifica trade history with retry logic
-                    let (pacifica_fill_price, pacifica_actual_fee, pacifica_notional): (Option<f64>, Option<f64>, Option<f64>) = if let Some(cloid) = &client_order_id {
-                        let result = trade_fetcher::fetch_pacifica_trade(
-                            self.pacifica_trading.clone(),
-                            &self.config.symbol,
-                            &cloid,
-                            3, // max_attempts
-                            |msg| {
-                                info!("{} {}",
-                                    format!("[{} PROFIT]", self.config.symbol).bright_blue().bold(),
-                                    msg
-                                );
-                            }
-                        ).await;
-                        (result.fill_price, result.actual_fee, result.total_notional)
-                    } else {
-                        (None, None, None)
-                    };
+                    // Fetch maker trade history with retry logic
+                    let (maker_fill_price, maker_actual_fee, maker_notional): (Option<f64>, Option<f64>, Option<f64>) =
+                        if client_order_id.is_some() || maker_order_id.is_some() {
+                            let result = trade_fetcher::fetch_maker_trade(
+                                self.maker_exchange.clone(),
+                                &self.config.symbol,
+                                client_order_id.as_deref(),
+                                maker_order_id.as_deref(),
+                                3, // max_attempts
+                                |msg| {
+                                    info!(
+                                        "{} {}",
+                                        format!("[{} PROFIT]", self.config.symbol).bright_blue().bold(),
+                                        msg
+                                    );
+                                },
+                            )
+                            .await;
+                            (result.fill_price, result.actual_fee, result.total_notional)
+                        } else {
+                            (None, None, None)
+                        };
 
                     // Fetch Hyperliquid user fills with retry logic
                     let hl_wallet = std::env::var("HL_WALLET").unwrap_or_default();
@@ -471,14 +476,14 @@ impl HedgeService {
                     };
 
                     // Calculate actual profitability using real fill data and actual fees
-                    let (actual_profit_bps, actual_profit_usd, pacifica_actual_price, hl_actual_price, pac_fee_usd, hl_fee_usd) =
-                        match (pacifica_notional, hl_notional, pacifica_fill_price, hl_fill_price) {
+                    let (actual_profit_bps, actual_profit_usd, maker_actual_price, hl_actual_price, maker_fee_usd, hl_fee_usd) =
+                        match (maker_notional, hl_notional, maker_fill_price, hl_fill_price) {
                             (Some(pac_notional), Some(hl_notional), pac_price_opt, hl_price_opt) => {
                                 // Use ACTUAL notional values from exchanges (not recalculated!)
-                                // This handles multi-fill trades correctly and avoids Pacifica API bugs
+                                // This handles multi-fill trades correctly
 
                                 // Use actual fees from trade history, or fall back to theoretical
-                                let pac_fee = pacifica_actual_fee.unwrap_or_else(|| {
+                                let pac_fee = maker_actual_fee.unwrap_or_else(|| {
                                     // Fallback: 1.5 bps on notional
                                     pac_notional * (self.config.pacifica_maker_fee_bps / 10000.0)
                                 });
@@ -539,16 +544,16 @@ impl HedgeService {
                         };
 
                     // Log trade to CSV file
-                    if pacifica_actual_price.is_some() && hl_actual_price.is_some() {
+                    if maker_actual_price.is_some() && hl_actual_price.is_some() {
                         let trade_record = csv_logger::TradeRecord::new(
                             Utc::now(),
                             end_to_end_latency.as_secs_f64() * 1000.0,  // Convert to milliseconds
                             self.config.symbol.clone(),
                             side,
-                            pacifica_actual_price.unwrap(),
+                            maker_actual_price.unwrap(),
                             size,
-                            pacifica_notional.unwrap_or(pacifica_actual_price.unwrap() * size),
-                            pac_fee_usd,
+                            maker_notional.unwrap_or(maker_actual_price.unwrap() * size),
+                            maker_fee_usd,
                             hl_actual_price.unwrap(),
                             size,
                             hl_notional.unwrap_or(hl_actual_price.unwrap() * size),
@@ -580,13 +585,13 @@ impl HedgeService {
                     info!("{}", "═══════════════════════════════════════════════════".green().bold());
                     info!("");
                     info!("{}", "📊 TRADE SUMMARY:".bright_white().bold());
-                    if let Some(pac_price) = pacifica_actual_price {
+                    if let Some(maker_price) = maker_actual_price {
                         info!("  {}: {} {} {} @ {} {}",
-                            "Pacifica".bright_magenta(),
+                            self.maker_exchange.name().bright_magenta(),
                             side.as_str().bright_yellow(),
                             format!("{:.4}", size).bright_white(),
                             self.config.symbol.bright_white().bold(),
-                            format!("${:.6}", pac_price).cyan().bold(),
+                            format!("${:.6}", maker_price).cyan().bold(),
                             "(actual fill)".bright_black()
                         );
                     }
@@ -605,7 +610,7 @@ impl HedgeService {
                     if let Some(expected) = expected_profit_bps {
                         info!("  Expected: {} bps", format!("{:.2}", expected).bright_white());
                     }
-                    if pacifica_actual_price.is_some() && hl_actual_price.is_some() {
+                    if maker_actual_price.is_some() && hl_actual_price.is_some() {
                         let profit_color = if actual_profit_bps > 0.0 { format!("{:.2}", actual_profit_bps).green().bold() } else { format!("{:.2}", actual_profit_bps).red().bold() };
                         let usd_color = if actual_profit_usd > 0.0 { format!("${:.4}", actual_profit_usd).green().bold() } else { format!("${:.4}", actual_profit_usd).red().bold() };
                         info!("  Actual:   {} bps ({})", profit_color, usd_color);
@@ -620,20 +625,21 @@ impl HedgeService {
                     }
                     info!("");
                     info!("{}", "📈 FEES:".bright_white().bold());
-                    if pacifica_actual_price.is_some() && hl_actual_price.is_some() {
+                    if maker_actual_price.is_some() && hl_actual_price.is_some() {
                         // Show actual fees paid
-                        info!("  Pacifica: {} {}",
-                            format!("${:.4}", pac_fee_usd).yellow(),
-                            if pacifica_actual_fee.is_some() { "(actual)" } else { "(estimated)" }.bright_black()
+                        info!("  {}: {} {}",
+                            self.maker_exchange.name(),
+                            format!("${:.4}", maker_fee_usd).yellow(),
+                            if maker_actual_fee.is_some() { "(actual)" } else { "(estimated)" }.bright_black()
                         );
                         info!("  Hyperliquid: {} {}",
                             format!("${:.4}", hl_fee_usd).yellow(),
                             if hl_actual_fee.is_some() { "(actual)" } else { "(estimated)" }.bright_black()
                         );
-                        info!("  Total: {}", format!("${:.4}", pac_fee_usd + hl_fee_usd).yellow().bold());
+                        info!("  Total: {}", format!("${:.4}", maker_fee_usd + hl_fee_usd).yellow().bold());
                     } else {
                         // Fallback to theoretical fees
-                        info!("  Pacifica (maker): {} bps", format!("{:.2}", self.config.pacifica_maker_fee_bps).yellow());
+                        info!("  {} (maker): {} bps", self.maker_exchange.name(), format!("{:.2}", self.config.pacifica_maker_fee_bps).yellow());
                         info!("  Hyperliquid (taker): {} bps", format!("{:.2}", self.config.hyperliquid_taker_fee_bps).yellow());
                         info!("  Total fees: {} bps", format!("{:.2}", self.config.pacifica_maker_fee_bps + self.config.hyperliquid_taker_fee_bps).yellow().bold());
                     }
@@ -643,14 +649,12 @@ impl HedgeService {
                     // Cancel all orders one last time before marking complete
                     // This ensures no stray orders remain active
                     info!("");
-                    info!("{} {} Post-hedge safety: Final cancellation of all Pacifica orders...",
+                    info!("{} {} Post-hedge safety: Final cancellation of all maker orders...",
                         format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                         "⚡".yellow().bold()
                     );
 
-                    if let Err(e) = self.pacifica_trading
-                        .cancel_all_orders(false, Some(&self.config.symbol), false)
-                        .await
+                    if let Err(e) = self.maker_exchange.cancel_all_orders(Some(&self.config.symbol)).await
                     {
                         warn!("{} {} Failed to cancel orders after hedge completion: {}",
                             format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
@@ -677,29 +681,29 @@ impl HedgeService {
                         format!("[{} VERIFY]", self.config.symbol).cyan().bold()
                     );
 
-                    // Check Pacifica position
-                    let pacifica_position = match self.pacifica_trading.get_positions().await {
+                    // Check maker exchange position
+                    let maker_position = match self.maker_exchange.get_positions(Some(&self.config.symbol)).await {
                         Ok(positions) => {
-                            if let Some(pos) = positions.iter().find(|p| p.symbol == self.config.symbol) {
-                                let amount: f64 = parse(&pos.amount).unwrap_or(0.0);
-                                let signed_amount = if pos.side == "bid" { amount } else { -amount };
-
-                                info!("{} Pacifica: {} {} (signed: {:.4})",
+                            if let Some(pos) = positions.first() {
+                                let signed_amount = pos.signed_amount();
+                                info!("{} {}: {:.4} {} (signed: {:.4})",
                                     format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
-                                    amount,
-                                    pos.side,
+                                    self.maker_exchange.name(),
+                                    pos.amount,
+                                    pos.side.as_str(),
                                     signed_amount
                                 );
                                 Some(signed_amount)
                             } else {
-                                info!("{} Pacifica: No position (flat)",
-                                    format!("[{} VERIFY]", self.config.symbol).cyan().bold()
+                                info!("{} {}: No position (flat)",
+                                    format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
+                                    self.maker_exchange.name()
                                 );
                                 Some(0.0)
                             }
                         }
                         Err(e) => {
-                            warn!("{} {} Failed to fetch Pacifica position: {}",
+                            warn!("{} {} Failed to fetch maker position: {}",
                                 format!("[{} VERIFY]", self.config.symbol).yellow().bold(),
                                 "⚠".yellow().bold(),
                                 e
@@ -754,14 +758,15 @@ impl HedgeService {
                     }
 
                     // Calculate net position across both exchanges
-                    if let (Some(pac_pos), Some(hl_pos)) = (pacifica_position, hyperliquid_position) {
-                        let net_position = pac_pos + hl_pos;
+                    if let (Some(maker_pos), Some(hl_pos)) = (maker_position, hyperliquid_position) {
+                        let net_position = maker_pos + hl_pos;
 
                         info!("");
-                        info!("{} Net Position: {:.4} (Pacifica: {:.4} + Hyperliquid: {:.4})",
+                        info!("{} Net Position: {:.4} ({}: {:.4} + Hyperliquid: {:.4})",
                             format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
                             net_position,
-                            pac_pos,
+                            self.maker_exchange.name(),
+                            maker_pos,
                             hl_pos
                         );
 
@@ -824,13 +829,14 @@ impl HedgeService {
 
                     // *** CRITICAL: CANCEL ALL ORDERS ON ERROR ***
                     // Even if hedge fails, cancel all orders to prevent stray positions
-                    info!("{} {} Error recovery: Cancelling all Pacifica orders...",
+                    info!("{} {} Error recovery: Cancelling all maker orders...",
                         format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                         "⚡".yellow().bold()
                     );
 
-                    if let Err(cancel_err) = self.pacifica_trading
-                        .cancel_all_orders(false, Some(&self.config.symbol), false)
+                    if let Err(cancel_err) = self
+                        .maker_exchange
+                        .cancel_all_orders(Some(&self.config.symbol))
                         .await
                     {
                         warn!("{} {} Failed to cancel orders after hedge error: {}",

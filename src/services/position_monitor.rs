@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, info, warn, error};
+use tracing::{debug, info, warn};
 use colored::Colorize;
 use fast_float::parse;
 use parking_lot::Mutex;

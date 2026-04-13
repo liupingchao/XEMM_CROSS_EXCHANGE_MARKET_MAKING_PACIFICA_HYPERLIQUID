@@ -1,4 +1,4 @@
-# XEMM Rust - Cross-Exchange Market Making Bot on Pacifica (Maker) and Hyperliquid (Taker)
+# XEMM Rust - Cross-Exchange Market Making Bot (Maker Abstraction + Hyperliquid Taker)
 
 A high-performance Rust trading bot that performs arbitrage between Pacifica (maker) and Hyperliquid (taker). The bot continuously monitors orderbook feeds from both exchanges, places limit orders on Pacifica when profitable opportunities arise, and immediately hedges fills on Hyperliquid.
 The main rationale is to use Hyperliquid's better liquidity, namely lower spreads, to do arbitrage trades on Pacifica immediately hedged on Hyperliquid.
@@ -117,14 +117,18 @@ This development branch introduces a low-latency, queue-based hedge pipeline and
 Create a `.env` file with your API credentials:
 
 ```bash
-# Pacifica credentials
-PACIFICA_API_KEY=your_api_key
-PACIFICA_SECRET_KEY=your_secret_key_base58
-PACIFICA_ACCOUNT=your_account_address
+# Pacifica credentials (when maker_exchange = "pacifica")
+SOL_WALLET=your_main_wallet
+API_PUBLIC=your_agent_wallet
+API_PRIVATE=your_agent_private_key
 
 # Hyperliquid credentials
 HL_WALLET=your_wallet_address
 HL_PRIVATE_KEY=your_private_key_hex
+
+# Binance Futures credentials (when maker_exchange = "binance")
+BINANCE_API_KEY=your_binance_api_key
+BINANCE_API_SECRET=your_binance_api_secret
 ```
 
 ### 2. Configure bot parameters
@@ -133,6 +137,7 @@ Edit `config.json`:
 
 ```json
 {
+  "maker_exchange": "pacifica",
   "symbol": "SOL",
   "reconnect_attempts": 5,
   "ping_interval_secs": 15,
@@ -159,6 +164,14 @@ RUST_LOG=debug cargo run
 # In release mode (optimized, full performance)
 cargo run --release
 ```
+
+## AWS Tokyo Deployment
+
+Quick runbook: [AWS_TOKYO_RUNBOOK.md](docs/AWS_TOKYO_RUNBOOK.md)
+
+Server scripts:
+- `scripts/aws/setup_tokyo_xemm.sh`
+- `scripts/aws/update_and_restart_xemm.sh`
 
 ## Architecture
 
@@ -239,6 +252,7 @@ The XEMM bot orchestrates 10 async tasks running in parallel:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| `maker_exchange` | "pacifica" | Maker backend (`pacifica` or `binance`) |
 | `symbol` | "SOL" | Trading symbol (must exist on both exchanges) |
 | `reconnect_attempts` | 5 | Number of WebSocket reconnection attempts with exponential backoff |
 | `agg_level` | 1 | Orderbook aggregation level (1, 2, 5, 10, 100, 1000) |

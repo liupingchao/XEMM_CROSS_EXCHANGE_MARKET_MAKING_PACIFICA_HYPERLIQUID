@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, info, warn, error};
+use tracing::{debug, info, error};
 use colored::Colorize;
 use fast_float::parse;
 
