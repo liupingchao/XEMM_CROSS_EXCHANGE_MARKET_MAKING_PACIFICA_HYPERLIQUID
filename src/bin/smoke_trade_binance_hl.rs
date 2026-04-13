@@ -13,6 +13,10 @@ fn parse_env_f64(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+fn parse_env_opt_f64(key: &str) -> Option<f64> {
+    std::env::var(key).ok().and_then(|v| v.parse::<f64>().ok())
+}
+
 fn parse_env_bool(key: &str, default: bool) -> bool {
     std::env::var(key)
         .ok()
@@ -34,6 +38,7 @@ async fn main() -> Result<()> {
     let binance_symbol = std::env::var("SMOKE_BINANCE_SYMBOL").unwrap_or_else(|_| "CLUSDT".to_string());
     let hl_symbol = std::env::var("SMOKE_HL_SYMBOL").unwrap_or_else(|_| "WTIOIL".to_string());
     let notional_usd = parse_env_f64("SMOKE_NOTIONAL_USD", 10.0);
+    let hl_fixed_size = parse_env_opt_f64("SMOKE_HL_FIXED_SIZE");
     let execute = parse_env_bool("SMOKE_EXECUTE", false);
     let skip_binance = parse_env_bool("SMOKE_SKIP_BINANCE", false);
     let skip_hl = parse_env_bool("SMOKE_SKIP_HL", false);
@@ -46,6 +51,9 @@ async fn main() -> Result<()> {
     info!("Binance symbol: {}", binance_symbol);
     info!("Hyperliquid symbol: {}", hl_symbol);
     info!("Notional: ${:.2}", notional_usd);
+    if let Some(sz) = hl_fixed_size {
+        info!("HL fixed size override: {}", sz);
+    }
     info!("Execute trades: {}", execute);
     info!("Skip Binance: {}", skip_binance);
     info!("Skip Hyperliquid: {}", skip_hl);
@@ -114,10 +122,11 @@ async fn main() -> Result<()> {
 
     if let Some((hl_bid, hl_ask)) = hl_tob {
         // Hyperliquid: open + close with ~10 USDC notional
-        let hl_qty = notional_usd / hl_ask.max(1e-12);
+        let hl_qty = hl_fixed_size.unwrap_or_else(|| notional_usd / hl_ask.max(1e-12));
         info!(
-            "[HYPERLIQUID] MARKET BUY then SELL, raw qty={:.8} (~${:.2})",
-            hl_qty, notional_usd
+            "[HYPERLIQUID] MARKET BUY then SELL, raw qty={:.8} (target notional ~${:.2})",
+            hl_qty,
+            hl_qty * hl_ask
         );
         let h_buy = hl
             .place_market_order(
