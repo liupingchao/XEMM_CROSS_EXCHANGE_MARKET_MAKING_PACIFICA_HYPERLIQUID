@@ -6,6 +6,7 @@ use colored::Colorize;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
+use crate::audit_logger;
 use crate::bot::BotState;
 use crate::connector::maker::{MakerExchange, MakerOrderSide};
 use crate::services::HedgeEvent;
@@ -150,6 +151,23 @@ impl RestFillDetectionService {
                                     format!("${:.2}", notional_value).cyan().bold(),
                                     "(REST API)".bright_black()
                                 );
+
+                                let fills_csv = audit_logger::fill_file_for_symbol(&self.symbol);
+                                let fill_record = audit_logger::FillRecord::new(
+                                    chrono::Utc::now(),
+                                    self.symbol.clone(),
+                                    self.maker_exchange.name().to_string(),
+                                    order_side,
+                                    new_fill_amount,
+                                    price,
+                                    is_full_fill,
+                                    Some(order.client_order_id.clone()),
+                                    order.order_id.clone(),
+                                    "rest_fill_detection".to_string(),
+                                );
+                                if let Err(e) = audit_logger::log_fill(&fills_csv, &fill_record) {
+                                    debug!("[REST_FILL_DETECTION] Failed to log fill CSV: {}", e);
+                                }
 
                                 let bot_state_clone = self.bot_state.clone();
                                 let hedge_tx_clone = self.hedge_tx.clone();

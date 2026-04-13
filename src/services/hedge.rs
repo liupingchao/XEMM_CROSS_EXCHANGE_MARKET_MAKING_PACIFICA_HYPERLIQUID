@@ -43,6 +43,8 @@ pub struct HedgeService {
     pub hedge_rx: mpsc::UnboundedReceiver<HedgeEvent>,
     pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
     pub config: Config,
+    pub maker_symbol: String,
+    pub hedge_symbol: String,
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
     pub maker_exchange: Arc<dyn MakerExchange>,
     pub shutdown_tx: mpsc::Sender<()>,
@@ -115,7 +117,7 @@ impl HedgeService {
             // or there was a race condition.
             // MOVED TO BACKGROUND TASK to avoid blocking hedge execution latency.
             let maker_exchange_bg = self.maker_exchange.clone();
-            let symbol_bg = self.config.symbol.clone();
+            let symbol_bg = self.maker_symbol.clone();
 
             tokio::spawn(async move {
                 info!("{} {} Pre-hedge safety: Cancelling maker orders (background)...",
@@ -160,7 +162,7 @@ impl HedgeService {
 
                 const MAX_ATTEMPTS: usize = 5;
                 for attempt in 1..=MAX_ATTEMPTS {
-                    match self.hyperliquid_trading.get_l2_snapshot(&self.config.symbol).await {
+                    match self.hyperliquid_trading.get_l2_snapshot(&self.hedge_symbol).await {
                         Ok(Some((bid, ask))) if bid > 0.0 && ask > 0.0 => {
                             hl_bid = bid;
                             hl_ask = ask;
@@ -272,7 +274,7 @@ impl HedgeService {
 
                             self.hyperliquid_trading
                                 .place_market_order(
-                                    &self.config.symbol,
+                                    &self.hedge_symbol,
                                     is_buy,
                                     size,
                                     self.config.hyperliquid_slippage,
@@ -287,7 +289,7 @@ impl HedgeService {
                     // No WS connection available – use REST for this hedge
                     self.hyperliquid_trading
                         .place_market_order(
-                            &self.config.symbol,
+                            &self.hedge_symbol,
                             is_buy,
                             size,
                             self.config.hyperliquid_slippage,
@@ -301,7 +303,7 @@ impl HedgeService {
                 // WS disabled via config – use REST only
                 self.hyperliquid_trading
                     .place_market_order(
-                        &self.config.symbol,
+                        &self.hedge_symbol,
                         is_buy,
                         size,
                         self.config.hyperliquid_slippage,
@@ -438,7 +440,7 @@ impl HedgeService {
                         if client_order_id.is_some() || maker_order_id.is_some() {
                             let result = trade_fetcher::fetch_maker_trade(
                                 self.maker_exchange.clone(),
-                                &self.config.symbol,
+                                &self.maker_symbol,
                                 client_order_id.as_deref(),
                                 maker_order_id.as_deref(),
                                 3, // max_attempts
@@ -462,7 +464,7 @@ impl HedgeService {
                         let result = trade_fetcher::fetch_hyperliquid_fills(
                             &self.hyperliquid_trading,
                             &hl_wallet,
-                            &self.config.symbol,
+                            &self.hedge_symbol,
                             3, // max_attempts
                             30, // time_window_secs
                             |msg| {
@@ -548,7 +550,7 @@ impl HedgeService {
                         let trade_record = csv_logger::TradeRecord::new(
                             Utc::now(),
                             end_to_end_latency.as_secs_f64() * 1000.0,  // Convert to milliseconds
-                            self.config.symbol.clone(),
+                            self.maker_symbol.clone(),
                             side,
                             maker_actual_price.unwrap(),
                             size,
@@ -563,7 +565,7 @@ impl HedgeService {
                             actual_profit_usd,
                         );
 
-                        let csv_file = format!("{}_trades.csv", self.config.symbol.to_lowercase());
+                        let csv_file = format!("{}_trades.csv", self.maker_symbol.to_lowercase());
                         if let Err(e) = csv_logger::log_trade(&csv_file, &trade_record) {
                             warn!("{} {} Failed to log trade to CSV: {}",
                                 format!("[{} CSV]", self.config.symbol).bright_yellow().bold(),
@@ -590,7 +592,7 @@ impl HedgeService {
                             self.maker_exchange.name().bright_magenta(),
                             side.as_str().bright_yellow(),
                             format!("{:.4}", size).bright_white(),
-                            self.config.symbol.bright_white().bold(),
+                            self.maker_symbol.bright_white().bold(),
                             format!("${:.6}", maker_price).cyan().bold(),
                             "(actual fill)".bright_black()
                         );
@@ -600,7 +602,7 @@ impl HedgeService {
                             "Hyperliquid".bright_magenta(),
                             if is_buy { "BUY".green() } else { "SELL".red() },
                             format!("{:.4}", size).bright_white(),
-                            self.config.symbol.bright_white().bold(),
+                            self.hedge_symbol.bright_white().bold(),
                             format!("${:.6}", hl_price).cyan().bold(),
                             "(actual fill)".bright_black()
                         );
@@ -654,7 +656,7 @@ impl HedgeService {
                         "⚡".yellow().bold()
                     );
 
-                    if let Err(e) = self.maker_exchange.cancel_all_orders(Some(&self.config.symbol)).await
+                    if let Err(e) = self.maker_exchange.cancel_all_orders(Some(&self.maker_symbol)).await
                     {
                         warn!("{} {} Failed to cancel orders after hedge completion: {}",
                             format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
@@ -682,7 +684,7 @@ impl HedgeService {
                     );
 
                     // Check maker exchange position
-                    let maker_position = match self.maker_exchange.get_positions(Some(&self.config.symbol)).await {
+                    let maker_position = match self.maker_exchange.get_positions(Some(&self.maker_symbol)).await {
                         Ok(positions) => {
                             if let Some(pos) = positions.first() {
                                 let signed_amount = pos.signed_amount();
@@ -728,7 +730,7 @@ impl HedgeService {
 
                         match self.hyperliquid_trading.get_user_state(&hl_wallet).await {
                             Ok(user_state) => {
-                                if let Some(asset_pos) = user_state.asset_positions.iter().find(|ap| ap.position.coin == self.config.symbol) {
+                                if let Some(asset_pos) = user_state.asset_positions.iter().find(|ap| ap.position.coin == self.hedge_symbol) {
                                     let szi: f64 = parse(&asset_pos.position.szi).unwrap_or(0.0);
                                     info!("{} Hyperliquid: {} (signed: {:.4})",
                                         format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
@@ -786,7 +788,7 @@ impl HedgeService {
                             warn!("{} Position delta: {:.4} {}",
                                 format!("[{} VERIFY]", self.config.symbol).red().bold(),
                                 net_position.abs(),
-                                self.config.symbol
+                                format!("{}|{}", self.maker_symbol, self.hedge_symbol)
                             );
                             warn!("{} This indicates a potential hedge failure or partial fill.",
                                 format!("[{} VERIFY]", self.config.symbol).red().bold()
@@ -836,7 +838,7 @@ impl HedgeService {
 
                     if let Err(cancel_err) = self
                         .maker_exchange
-                        .cancel_all_orders(Some(&self.config.symbol))
+                        .cancel_all_orders(Some(&self.maker_symbol))
                         .await
                     {
                         warn!("{} {} Failed to cancel orders after hedge error: {}",
@@ -892,7 +894,7 @@ impl HedgeService {
         let payload = self
             .hyperliquid_trading
             .build_market_order_request(
-                &self.config.symbol,
+                &self.hedge_symbol,
                 is_buy,
                 size,
                 self.config.hyperliquid_slippage,

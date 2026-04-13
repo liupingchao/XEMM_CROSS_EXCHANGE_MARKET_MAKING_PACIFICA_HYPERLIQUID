@@ -6,6 +6,7 @@ use colored::Colorize;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
+use crate::audit_logger;
 use crate::bot::{BotState, BotStatus};
 use crate::connector::binance::{
     BinanceCredentials, BinanceUserStreamClient, BinanceUserStreamConfig, BinanceUserStreamEvent,
@@ -198,6 +199,23 @@ impl BinanceFillDetectionService {
                                 format!("{:.6}", cumulative_fill_qty).bright_white(),
                                 notional_value
                             );
+
+                            let fills_csv = audit_logger::fill_file_for_symbol(&symbol);
+                            let fill_record = audit_logger::FillRecord::new(
+                                chrono::Utc::now(),
+                                symbol.clone(),
+                                maker_exchange.name().to_string(),
+                                order_side,
+                                incremental_fill,
+                                fill_price,
+                                is_full_fill,
+                                client_order_id.clone(),
+                                order_id.clone(),
+                                "binance_user_stream".to_string(),
+                            );
+                            if let Err(e) = audit_logger::log_fill(&fills_csv, &fill_record) {
+                                debug!("[BINANCE_FILL] Failed to log fill CSV: {}", e);
+                            }
 
                             {
                                 let mut state = bot_state.write().await;

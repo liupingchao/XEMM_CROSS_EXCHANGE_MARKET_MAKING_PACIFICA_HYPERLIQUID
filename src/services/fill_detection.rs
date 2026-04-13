@@ -5,6 +5,7 @@ use tracing::{debug, info, error};
 use colored::Colorize;
 use fast_float::parse;
 
+use crate::audit_logger;
 use crate::bot::{BotState, BotStatus};
 use crate::connector::pacifica::{
     FillDetectionClient, FillDetectionConfig, FillEvent, PacificaTrading, PacificaWsTrading,
@@ -127,6 +128,24 @@ impl FillDetectionService {
                                 };
 
                                 let filled_size: f64 = parse(&filled_amount_str).unwrap_or(0.0);
+                                let avg_px: f64 = parse(&avg_price_str).unwrap_or(0.0);
+
+                                let fills_csv = audit_logger::fill_file_for_symbol(&symbol_clone);
+                                let fill_record = audit_logger::FillRecord::new(
+                                    chrono::Utc::now(),
+                                    symbol_clone.clone(),
+                                    "Pacifica".to_string(),
+                                    order_side,
+                                    filled_size,
+                                    avg_px,
+                                    true,
+                                    cloid.clone(),
+                                    None,
+                                    "pacifica_ws_full_fill".to_string(),
+                                );
+                                if let Err(e) = audit_logger::log_fill(&fills_csv, &fill_record) {
+                                    debug!("[FILL_DETECTION] Failed to log fill CSV: {}", e);
+                                }
 
                                 {
                                     let mut state = bot_state_clone.write().await;
@@ -179,7 +198,6 @@ impl FillDetectionService {
 
                                 // *** CRITICAL: UPDATE POSITION BASELINE ***
                                 // This prevents position-based detection from triggering duplicate hedge
-                                let avg_px: f64 = parse(&avg_price_str).unwrap_or(0.0);
                                 baseline_updater_clone.update_baseline(
                                     &symbol_clone,
                                     &side_str,
@@ -340,6 +358,24 @@ impl FillDetectionService {
                                     };
 
                                     let filled_size: f64 = parse(&filled_amount_str).unwrap_or(0.0);
+                                    let avg_px: f64 = parse(&avg_price_str).unwrap_or(0.0);
+
+                                    let fills_csv = audit_logger::fill_file_for_symbol(&symbol_clone);
+                                    let fill_record = audit_logger::FillRecord::new(
+                                        chrono::Utc::now(),
+                                        symbol_clone.clone(),
+                                        "Pacifica".to_string(),
+                                        order_side,
+                                        filled_size,
+                                        avg_px,
+                                        false,
+                                        cloid.clone(),
+                                        None,
+                                        "pacifica_ws_partial_fill".to_string(),
+                                    );
+                                    if let Err(e) = audit_logger::log_fill(&fills_csv, &fill_record) {
+                                        debug!("[FILL_DETECTION] Failed to log fill CSV: {}", e);
+                                    }
 
                                     {
                                         let mut state = bot_state_clone.write().await;
@@ -391,7 +427,6 @@ impl FillDetectionService {
                                     });
 
                                     // *** CRITICAL: UPDATE POSITION BASELINE ***
-                                    let avg_px: f64 = parse(&avg_price_str).unwrap_or(0.0);
                                     baseline_updater_clone.update_baseline(
                                         &symbol_clone,
                                         &side_str,

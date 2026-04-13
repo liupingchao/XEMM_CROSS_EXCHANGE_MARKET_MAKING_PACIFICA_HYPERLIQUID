@@ -39,9 +39,10 @@ async fn main() -> Result<()> {
     dotenv::dotenv().ok();
     let config = Config::load_default().context("Failed to load config.json")?;
 
-    let maker_symbol =
-        env::var("SPREAD_TEST_MAKER_SYMBOL").unwrap_or_else(|_| config.symbol.clone());
-    let hl_symbol = env::var("SPREAD_TEST_HL_SYMBOL").unwrap_or_else(|_| config.symbol.clone());
+    let maker_symbol = env::var("SPREAD_TEST_MAKER_SYMBOL")
+        .unwrap_or_else(|_| config.maker_symbol_str().to_string());
+    let hl_symbol = env::var("SPREAD_TEST_HL_SYMBOL")
+        .unwrap_or_else(|_| config.hedge_symbol_str().to_string());
     let duration_secs = parse_env_u64("SPREAD_TEST_DURATION_SECS", 60);
     let sample_interval_secs = parse_env_u64("SPREAD_TEST_SAMPLE_INTERVAL_SECS", 1).max(1);
     let retention_hours = parse_env_i64("SPREAD_TEST_RETENTION_HOURS", 24);

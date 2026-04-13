@@ -124,6 +124,8 @@ pub struct OrderMonitorService {
     
     // Configuration
     pub config: Config,
+    pub maker_symbol: String,
+    pub hedge_symbol: String,
     pub evaluator: OpportunityEvaluator,
     
     // Trading connectors (only used by cancellation task)
@@ -143,6 +145,8 @@ impl OrderMonitorService {
         pacifica_prices: Arc<Mutex<(f64, f64)>>,
         hyperliquid_prices: Arc<Mutex<(f64, f64)>>,
         config: Config,
+        maker_symbol: String,
+        hedge_symbol: String,
         evaluator: OpportunityEvaluator,
         maker_exchange: Arc<dyn MakerExchange>,
         hyperliquid_trading: Arc<HyperliquidTrading>,
@@ -157,6 +161,8 @@ impl OrderMonitorService {
             pacifica_prices,
             hyperliquid_prices,
             config,
+            maker_symbol,
+            hedge_symbol,
             evaluator,
             maker_exchange,
             hyperliquid_trading,
@@ -204,7 +210,7 @@ impl OrderMonitorService {
             if age > age_threshold {
                 // Send cancel request (non-blocking)
                 let _ = self.cancel_tx.try_send(CancelRequest::AgeExpiry {
-                    symbol: self.config.symbol.clone(),
+                    symbol: self.maker_symbol.clone(),
                     reason: format!("age {}ms > {}s threshold", age.as_millis(), self.config.order_refresh_interval_secs),
                 });
                 continue;
@@ -225,7 +231,7 @@ impl OrderMonitorService {
             if profit_deviation > profit_threshold {
                 // Send cancel request (non-blocking)
                 let _ = self.cancel_tx.try_send(CancelRequest::ProfitDeviation {
-                    symbol: self.config.symbol.clone(),
+                    symbol: self.maker_symbol.clone(),
                     current_profit_bps: current_profit,
                     deviation_bps: profit_deviation,
                 });
@@ -394,7 +400,7 @@ impl OrderMonitorService {
         };
         drop(state);
 
-        match self.maker_exchange.get_open_orders(Some(&self.config.symbol)).await {
+        match self.maker_exchange.get_open_orders(Some(&self.maker_symbol)).await {
             Ok(orders) => {
                 if let Some(order) = orders.iter().find(|o| o.client_order_id == client_order_id) {
                     let filled_amount = order.filled_amount;
@@ -414,10 +420,10 @@ impl OrderMonitorService {
     /// Refresh prices from both exchanges in parallel
     async fn refresh_prices_parallel(&self) {
         let pac_future = self.maker_exchange.get_best_bid_ask_rest(
-            &self.config.symbol,
+            &self.maker_symbol,
             self.config.agg_level,
         );
-        let hl_future = self.hyperliquid_trading.get_l2_snapshot(&self.config.symbol);
+        let hl_future = self.hyperliquid_trading.get_l2_snapshot(&self.hedge_symbol);
 
         let (pac_result, hl_result) = tokio::join!(pac_future, hl_future);
 

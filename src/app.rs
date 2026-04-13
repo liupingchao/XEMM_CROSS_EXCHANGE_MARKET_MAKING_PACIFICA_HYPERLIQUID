@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
 use tracing::{debug, info};
 
+use crate::audit_logger;
 use crate::bot::{ActiveOrder, BotState, BotStatus};
 use crate::config::Config;
 use crate::connector::binance::{BinanceCredentials, BinanceTrading};
@@ -115,10 +116,13 @@ impl XemmBot {
         // Load configuration
         let config = Config::load_default().context("Failed to load config.json")?;
         config.validate().context("Invalid configuration")?;
+        let maker_symbol = config.maker_symbol_str().to_string();
+        let hedge_symbol = config.hedge_symbol_str().to_string();
 
-        info!("{} Symbol: {}",
+        info!("{} Symbol Pair: {} -> {}",
             "[CONFIG]".blue().bold(),
-            config.symbol.bright_white().bold()
+            maker_symbol.bright_white().bold(),
+            hedge_symbol.bright_white().bold()
         );
         info!("{} Order Notional: {}",
             "[CONFIG]".blue().bold(),
@@ -228,7 +232,7 @@ impl XemmBot {
         // Pre-fetch Hyperliquid metadata (szDecimals, etc.) to reduce hedge latency
         info!("{} Pre-fetching Hyperliquid metadata for {}...",
             "[INIT]".cyan().bold(),
-            config.symbol.bright_white()
+            hedge_symbol.bright_white()
         );
         hyperliquid_trading
             .get_meta()
@@ -244,7 +248,7 @@ impl XemmBot {
             "[INIT]".cyan().bold(),
             maker_exchange.name()
         );
-        match maker_exchange.cancel_all_orders(Some(&config.symbol)).await {
+        match maker_exchange.cancel_all_orders(Some(&maker_symbol)).await {
             Ok(count) => info!("{} {} Cancelled {} existing order(s)",
                 "[INIT]".cyan().bold(),
                 "✓".green().bold(),
@@ -259,7 +263,7 @@ impl XemmBot {
 
         // Get maker symbol info to determine tick size
         let maker_symbol_info = maker_exchange
-            .get_symbol_info(&config.symbol)
+            .get_symbol_info(&maker_symbol)
             .await
             .with_context(|| format!("Failed to fetch {} symbol info", maker_exchange.name()))?;
         let maker_tick_size = maker_symbol_info.tick_size;
@@ -267,7 +271,7 @@ impl XemmBot {
         info!("{} {} tick size for {}: {}",
             "[INIT]".cyan().bold(),
             maker_exchange.name(),
-            config.symbol.bright_white(),
+            maker_symbol.bright_white(),
             format!("{}", maker_tick_size).bright_white()
         );
 
@@ -336,6 +340,10 @@ impl XemmBot {
 
     /// Run the bot - spawn all services and execute main loop
     pub async fn run(mut self) -> Result<()> {
+        let maker_symbol = self.config.maker_symbol_str().to_string();
+        let hedge_symbol = self.config.hedge_symbol_str().to_string();
+        let symbol_pair = format!("{}|{}", maker_symbol, hedge_symbol);
+
         // ═══════════════════════════════════════════════════
         // SPAWN ALL SERVICES
         // ═══════════════════════════════════════════════════
@@ -344,7 +352,7 @@ impl XemmBot {
         if matches!(self.maker_kind, MakerExchangeKind::Pacifica) {
             let pacifica_ob_service = PacificaOrderbookService {
                 prices: self.pacifica_prices.clone(),
-                symbol: self.config.symbol.clone(),
+                symbol: maker_symbol.clone(),
                 agg_level: self.config.agg_level,
                 reconnect_attempts: self.config.reconnect_attempts,
                 ping_interval_secs: self.config.ping_interval_secs,
@@ -363,7 +371,7 @@ impl XemmBot {
         // Service 2: Hyperliquid Orderbook (WebSocket)
         let hyperliquid_ob_service = HyperliquidOrderbookService {
             prices: self.hyperliquid_prices.clone(),
-            symbol: self.config.symbol.clone(),
+            symbol: hedge_symbol.clone(),
             reconnect_attempts: self.config.reconnect_attempts,
             ping_interval_secs: self.config.ping_interval_secs,
         };
@@ -393,7 +401,7 @@ impl XemmBot {
                 pacifica_trading: pac_trading_fill,
                 pacifica_ws_trading: pac_ws,
                 fill_config,
-                symbol: self.config.symbol.clone(),
+                symbol: maker_symbol.clone(),
                 processed_fills: self.processed_fills.clone(),
                 baseline_updater,
                 atomic_status: self.atomic_status.clone(),
@@ -408,7 +416,7 @@ impl XemmBot {
                 bot_state: self.bot_state.clone(),
                 hedge_tx: self.hedge_tx.clone(),
                 maker_exchange: self.maker_exchange.clone(),
-                symbol: self.config.symbol.clone(),
+                symbol: maker_symbol.clone(),
                 processed_fills: self.processed_fills.clone(),
                 reconnect_attempts: self.config.reconnect_attempts,
                 ping_interval_secs: self.config.ping_interval_secs,
@@ -423,7 +431,7 @@ impl XemmBot {
         let maker_rest_poll_service = MakerRestPollService {
             prices: self.pacifica_prices.clone(),
             maker_exchange: self.maker_exchange.clone(),
-            symbol: self.config.symbol.clone(),
+            symbol: maker_symbol.clone(),
             agg_level: self.config.agg_level,
             poll_interval_secs: self.config.pacifica_rest_poll_interval_secs,
         };
@@ -435,7 +443,7 @@ impl XemmBot {
         let hyperliquid_rest_poll_service = HyperliquidRestPollService {
             prices: self.hyperliquid_prices.clone(),
             hyperliquid_trading: self.hyperliquid_trading.clone(),
-            symbol: self.config.symbol.clone(),
+            symbol: hedge_symbol.clone(),
             poll_interval_secs: 2,
         };
         tokio::spawn(async move {
@@ -444,11 +452,15 @@ impl XemmBot {
 
         // Service 4.6: Spread recorder (1-second sampling, 24h retention)
         let spread_recorder_service = SpreadRecorderService {
-            symbol: self.config.symbol.clone(),
+            symbol: symbol_pair.clone(),
             maker_exchange: self.maker_exchange.name().to_string(),
             maker_prices: self.pacifica_prices.clone(),
             hyperliquid_prices: self.hyperliquid_prices.clone(),
-            file_path: format!("{}_spread_history.csv", self.config.symbol.to_lowercase()),
+            file_path: format!(
+                "{}_{}_spread_history.csv",
+                maker_symbol.to_lowercase(),
+                hedge_symbol.to_lowercase().replace(':', "_")
+            ),
             sample_interval_secs: 1,
             retention_hours: 24,
         };
@@ -465,7 +477,7 @@ impl XemmBot {
             bot_state: self.bot_state.clone(),
             hedge_tx: self.hedge_tx.clone(),
             maker_exchange: self.maker_exchange.clone(),
-            symbol: self.config.symbol.clone(),
+            symbol: maker_symbol.clone(),
             processed_fills: self.processed_fills.clone(),
             min_hedge_notional: 10.0,
             poll_interval_ms: self.config.pacifica_active_order_rest_poll_interval_ms,
@@ -486,7 +498,7 @@ impl XemmBot {
                 hedge_tx: self.hedge_tx.clone(),
                 pacifica_trading: pac_trading,
                 pacifica_ws_trading: pac_ws,
-                symbol: self.config.symbol.clone(),
+                symbol: maker_symbol.clone(),
                 processed_fills: self.processed_fills.clone(),
                 last_position_snapshot: self.last_position_snapshot.clone(),
             };
@@ -504,6 +516,8 @@ impl XemmBot {
             self.pacifica_prices.clone(),
             self.hyperliquid_prices.clone(),
             self.config.clone(),
+            maker_symbol.clone(),
+            hedge_symbol.clone(),
             self.evaluator.clone(),
             self.maker_exchange.clone(),
             self.hyperliquid_trading.clone(),
@@ -517,6 +531,8 @@ impl XemmBot {
             hedge_rx: self.hedge_rx.take().unwrap(),
             hyperliquid_prices: self.hyperliquid_prices.clone(),
             config: self.config.clone(),
+            maker_symbol: maker_symbol.clone(),
+            hedge_symbol: hedge_symbol.clone(),
             hyperliquid_trading: self.hyperliquid_trading.clone(),
             maker_exchange: self.maker_exchange.clone(),
             shutdown_tx: self.shutdown_tx.clone(),
@@ -530,7 +546,7 @@ impl XemmBot {
         // ═══════════════════════════════════════════════════
 
         info!("{} Starting opportunity evaluation loop",
-            format!("[{} MAIN]", self.config.symbol).bright_white().bold()
+            format!("[{} MAIN]", symbol_pair).bright_white().bold()
         );
         info!("");
 
@@ -550,7 +566,7 @@ impl XemmBot {
             tokio::select! {
                 _ = &mut sigint => {
                     info!("{} {} Received SIGINT (Ctrl+C), initiating graceful shutdown...",
-                        format!("[{} MAIN]", self.config.symbol).bright_white().bold(),
+                        format!("[{} MAIN]", symbol_pair).bright_white().bold(),
                         "⚠".yellow().bold()
                     );
                     break;
@@ -567,7 +583,7 @@ impl XemmBot {
                     }
                 } => {
                     info!("{} {} Received SIGTERM (Docker shutdown), initiating graceful shutdown...",
-                        format!("[{} MAIN]", self.config.symbol).bright_white().bold(),
+                        format!("[{} MAIN]", symbol_pair).bright_white().bold(),
                         "⚠".yellow().bold()
                     );
                     break;
@@ -631,7 +647,7 @@ impl XemmBot {
 
                         info!(
                             "{} {} @ {} → HL {} | Size: {} | Profit: {} | PAC: {}/{} | HL: {}/{}",
-                            format!("[{} OPPORTUNITY]", self.config.symbol).bright_green().bold(),
+                            format!("[{} OPPORTUNITY]", symbol_pair).bright_green().bold(),
                             opp.direction.as_str().bright_yellow().bold(),
                             format!("${:.6}", opp.pacifica_price).cyan().bold(),
                             format!("${:.6}", opp.hyperliquid_price).cyan(),
@@ -645,7 +661,7 @@ impl XemmBot {
 
                         // Place order
                         info!("{} Placing {} on {}...",
-                            format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
+                            format!("[{} ORDER]", symbol_pair).bright_yellow().bold(),
                             opp.direction.as_str().bright_yellow().bold(),
                             self.maker_exchange.name()
                         );
@@ -654,7 +670,7 @@ impl XemmBot {
 
                         match self.maker_exchange
                             .place_limit_order(
-                                &self.config.symbol,
+                                &maker_symbol,
                                 maker_side,
                                 opp.size,
                                 opp.pacifica_price,
@@ -682,7 +698,7 @@ impl XemmBot {
                                     };
                                     info!(
                                         "{} {} Placed {} #{} @ {} | cloid: {}...{}",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
+                                        format!("[{} ORDER]", symbol_pair).bright_yellow().bold(),
                                         "✓".green().bold(),
                                         opp.direction.as_str().bright_yellow(),
                                         order_id,
@@ -691,10 +707,31 @@ impl XemmBot {
                                         cloid_tail
                                     );
 
+                                    let order_csv = audit_logger::order_file_for_symbol(&maker_symbol);
+                                    let order_record = audit_logger::OrderRecord::new(
+                                        chrono::Utc::now(),
+                                        maker_symbol.clone(),
+                                        self.maker_exchange.name().to_string(),
+                                        opp.direction,
+                                        opp.size,
+                                        opp.pacifica_price,
+                                        order_data.order_id.clone(),
+                                        Some(client_order_id.clone()),
+                                        "main_loop_limit_order".to_string(),
+                                    );
+                                    if let Err(e) = audit_logger::log_order(&order_csv, &order_record) {
+                                        info!(
+                                            "{} {} Failed to log order to CSV: {}",
+                                            format!("[{} ORDER]", symbol_pair).bright_yellow().bold(),
+                                            "⚠".yellow().bold(),
+                                            e
+                                        );
+                                    }
+
                                     let active_order = ActiveOrder {
                                         client_order_id,
                                         exchange_order_id: order_data.order_id.clone(),
-                                        symbol: self.config.symbol.clone(),
+                                        symbol: maker_symbol.clone(),
                                         side: opp.direction,
                                         price: opp.pacifica_price,
                                         size: opp.size,
@@ -715,7 +752,7 @@ impl XemmBot {
                                     );
                                 } else {
                                     info!("{} {} Order placed but no id returned",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
+                                        format!("[{} ORDER]", symbol_pair).bright_yellow().bold(),
                                         "✗".red().bold()
                                     );
                                 }
@@ -726,14 +763,14 @@ impl XemmBot {
                                     let backoff_secs = order_placement_rate_limit.get_backoff_secs();
                                     info!(
                                         "{} {} Failed to place order: Rate limit exceeded. Backing off for {}s (attempt #{})",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
+                                        format!("[{} ORDER]", symbol_pair).bright_yellow().bold(),
                                         "⚠".yellow().bold(),
                                         backoff_secs,
                                         order_placement_rate_limit.consecutive_errors()
                                     );
                                 } else {
                                     info!("{} {} Failed to place order: {}",
-                                        format!("[{} ORDER]", self.config.symbol).bright_yellow().bold(),
+                                        format!("[{} ORDER]", symbol_pair).bright_yellow().bold(),
                                         "✗".red().bold(),
                                         e.to_string().red()
                                     );
@@ -745,7 +782,7 @@ impl XemmBot {
 
                 _ = shutdown_rx.recv() => {
                     info!("{} Shutdown signal received",
-                        format!("[{} MAIN]", self.config.symbol).bright_white().bold()
+                        format!("[{} MAIN]", symbol_pair).bright_white().bold()
                     );
                     break;
                 }
@@ -758,17 +795,17 @@ impl XemmBot {
 
         info!("");
         info!("{} Cancelling any remaining orders...",
-            format!("[{} SHUTDOWN]", self.config.symbol).yellow().bold()
+            format!("[{} SHUTDOWN]", symbol_pair).yellow().bold()
         );
 
-        match self.maker_exchange.cancel_all_orders(Some(&self.config.symbol)).await {
+        match self.maker_exchange.cancel_all_orders(Some(&maker_symbol)).await {
             Ok(count) => info!("{} {} Cancelled {} order(s)",
-                format!("[{} SHUTDOWN]", self.config.symbol).yellow().bold(),
+                format!("[{} SHUTDOWN]", symbol_pair).yellow().bold(),
                 "✓".green().bold(),
                 count
             ),
             Err(e) => info!("{} {} Failed to cancel orders: {}",
-                format!("[{} SHUTDOWN]", self.config.symbol).yellow().bold(),
+                format!("[{} SHUTDOWN]", symbol_pair).yellow().bold(),
                 "⚠".yellow().bold(),
                 e
             ),

@@ -7,6 +7,7 @@ use colored::Colorize;
 use fast_float::parse;
 use parking_lot::Mutex;
 
+use crate::audit_logger;
 use crate::app::PositionSnapshot;
 use crate::bot::BotState;
 use crate::connector::pacifica::{PacificaTrading, PacificaWsTrading};
@@ -269,6 +270,23 @@ impl PositionMonitorService {
                             let estimated_price = current_position
                                 .and_then(|p| p.entry_price.parse::<f64>().ok())
                                 .unwrap_or(0.0);
+
+                            let fills_csv = audit_logger::fill_file_for_symbol(&self.symbol);
+                            let fill_record = audit_logger::FillRecord::new(
+                                chrono::Utc::now(),
+                                self.symbol.clone(),
+                                "Pacifica".to_string(),
+                                order_side,
+                                fill_size,
+                                estimated_price,
+                                true,
+                                Some(client_order_id.clone()),
+                                None,
+                                "position_monitor".to_string(),
+                            );
+                            if let Err(e) = audit_logger::log_fill(&fills_csv, &fill_record) {
+                                debug!("[POSITION_MONITOR] Failed to log fill CSV: {}", e);
+                            }
 
                             info!("{} Triggering hedge for position-detected fill",
                                 "[POSITION_MONITOR]".bright_cyan().bold()

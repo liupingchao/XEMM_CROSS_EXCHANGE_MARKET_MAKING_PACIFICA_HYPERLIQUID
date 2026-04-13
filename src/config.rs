@@ -10,8 +10,17 @@ pub struct Config {
     #[serde(default = "default_maker_exchange")]
     pub maker_exchange: String,
 
-    /// Trading symbol (e.g., "SOL", "BTC", "ETH")
+    /// Trading symbol (legacy single-symbol mode, e.g., "SOL", "BTC", "ETH")
+    /// Used as fallback when maker_symbol/hedge_symbol are not provided.
     pub symbol: String,
+
+    /// Maker exchange symbol (e.g., "CLUSDT" on Binance futures)
+    #[serde(default)]
+    pub maker_symbol: Option<String>,
+
+    /// Hedge exchange symbol (e.g., "xyz:CL" on Hyperliquid)
+    #[serde(default)]
+    pub hedge_symbol: Option<String>,
 
     /// Orderbook aggregation level (1, 2, 5, 10, 100, 1000)
     #[serde(default = "default_agg_level")]
@@ -138,6 +147,8 @@ impl Default for Config {
         Self {
             maker_exchange: default_maker_exchange(),
             symbol: "SOL".to_string(),
+            maker_symbol: None,
+            hedge_symbol: None,
             agg_level: default_agg_level(),
             reconnect_attempts: default_reconnect_attempts(),
             ping_interval_secs: default_ping_interval(),
@@ -157,6 +168,16 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Effective maker symbol (maker_symbol if set, otherwise legacy symbol).
+    pub fn maker_symbol_str(&self) -> &str {
+        self.maker_symbol.as_deref().unwrap_or(&self.symbol)
+    }
+
+    /// Effective hedge symbol (hedge_symbol if set, otherwise legacy symbol).
+    pub fn hedge_symbol_str(&self) -> &str {
+        self.hedge_symbol.as_deref().unwrap_or(&self.symbol)
+    }
+
     /// Load configuration from a JSON file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
@@ -190,6 +211,14 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         // Check symbol is not empty
         anyhow::ensure!(!self.symbol.is_empty(), "Symbol cannot be empty");
+        anyhow::ensure!(
+            !self.maker_symbol_str().trim().is_empty(),
+            "maker_symbol (or symbol fallback) cannot be empty"
+        );
+        anyhow::ensure!(
+            !self.hedge_symbol_str().trim().is_empty(),
+            "hedge_symbol (or symbol fallback) cannot be empty"
+        );
 
         // Check maker exchange value
         let maker = self.maker_exchange.to_ascii_lowercase();
