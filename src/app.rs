@@ -27,7 +27,9 @@ use crate::services::{
     order_monitor::{AtomicBotStatus, OrderMonitorService, SharedOrderSnapshot, spawn_monitor_tasks, sync_atomic_status, update_order_snapshot},
     orderbook::{HyperliquidOrderbookService, PacificaOrderbookService},
     position_monitor::PositionMonitorService, rest_fill_detection::RestFillDetectionService,
-    rest_poll::{HyperliquidRestPollService, MakerRestPollService}, HedgeEvent,
+    rest_poll::{HyperliquidRestPollService, MakerRestPollService},
+    spread_recorder::SpreadRecorderService,
+    HedgeEvent,
 };
 use crate::strategy::OpportunityEvaluator;
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
@@ -438,6 +440,20 @@ impl XemmBot {
         };
         tokio::spawn(async move {
             hyperliquid_rest_poll_service.run().await;
+        });
+
+        // Service 4.6: Spread recorder (1-second sampling, 24h retention)
+        let spread_recorder_service = SpreadRecorderService {
+            symbol: self.config.symbol.clone(),
+            maker_exchange: self.maker_exchange.name().to_string(),
+            maker_prices: self.pacifica_prices.clone(),
+            hyperliquid_prices: self.hyperliquid_prices.clone(),
+            file_path: format!("{}_spread_history.csv", self.config.symbol.to_lowercase()),
+            sample_interval_secs: 1,
+            retention_hours: 24,
+        };
+        tokio::spawn(async move {
+            spread_recorder_service.run().await;
         });
 
         // Wait for initial orderbook data
