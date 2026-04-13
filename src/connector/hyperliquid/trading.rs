@@ -491,11 +491,17 @@ impl HyperliquidTrading {
             .build_market_order_request(coin, is_buy, size, slippage, reduce_only, bid, ask)
             .await?;
 
+        let exchange_url = if let Some(dex) = Self::dex_from_coin(coin) {
+            format!("{}?dex={}", self.exchange_url, dex)
+        } else {
+            self.exchange_url.clone()
+        };
+
         // Send order via REST API
         debug!("[HYPERLIQUID] Sending order to exchange");
         let response = self
             .client
-            .post(&self.exchange_url)
+            .post(&exchange_url)
             .json(&payload)
             .send()
             .await
