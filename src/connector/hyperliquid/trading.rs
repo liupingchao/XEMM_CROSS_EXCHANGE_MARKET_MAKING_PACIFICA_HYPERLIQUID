@@ -93,6 +93,40 @@ impl HyperliquidTrading {
             .filter(|dex| !dex.is_empty())
     }
 
+    async fn get_perp_dex_index(&self, dex: &str) -> Result<u32> {
+        #[derive(serde::Deserialize)]
+        struct PerpDexEntry {
+            name: String,
+        }
+
+        let response = self
+            .client
+            .post(&self.info_url)
+            .json(&json!({
+                "type": "perpDexs"
+            }))
+            .send()
+            .await
+            .context("Failed to fetch perpDexs")?;
+
+        let body = response
+            .text()
+            .await
+            .context("Failed to read perpDexs response")?;
+        let dexs: Vec<Option<PerpDexEntry>> =
+            serde_json::from_str(&body).context("Failed to parse perpDexs response")?;
+
+        dexs.iter()
+            .enumerate()
+            .find_map(|(idx, entry)| {
+                entry
+                    .as_ref()
+                    .filter(|e| e.name == dex)
+                    .map(|_| idx as u32)
+            })
+            .with_context(|| format!("perpDex '{}' not found in perpDexs", dex))
+    }
+
     async fn get_meta_for_dex(&self, dex: Option<&str>) -> Result<MetaResponse> {
         let cache_key = dex.unwrap_or("").to_string();
 
@@ -149,7 +183,8 @@ impl HyperliquidTrading {
 
     /// Get asset ID from coin name
     pub async fn get_asset_id(&self, coin: &str) -> Result<u32> {
-        let meta = self.get_meta_for_dex(Self::dex_from_coin(coin)).await?;
+        let dex = Self::dex_from_coin(coin);
+        let meta = self.get_meta_for_dex(dex).await?;
 
         let asset_index = meta
             .universe
@@ -157,7 +192,15 @@ impl HyperliquidTrading {
             .position(|asset| asset.name == coin)
             .with_context(|| format!("Asset {} not found in meta", coin))?;
 
-        Ok(asset_index as u32)
+        if let Some(dex_name) = dex {
+            // Builder perp asset id format:
+            // 100000 + perp_dex_index * 10000 + index_in_meta
+            // Reference: Hyperliquid docs "Asset IDs"
+            let perp_dex_index = self.get_perp_dex_index(dex_name).await?;
+            Ok(100000 + perp_dex_index * 10000 + asset_index as u32)
+        } else {
+            Ok(asset_index as u32)
+        }
     }
 
     /// Get asset metadata (szDecimals, etc.)
@@ -408,7 +451,7 @@ impl HyperliquidTrading {
         };
 
         // Round price and size
-        let is_spot = asset_id >= 10000;
+        let is_spot = coin.starts_with('@');
         let limit_price_str = Self::round_price(limit_price, asset_info.sz_decimals, is_spot, is_buy, true); // aggressive=true for market orders
         let size_str = Self::round_size(size, asset_info.sz_decimals);
 
@@ -491,17 +534,11 @@ impl HyperliquidTrading {
             .build_market_order_request(coin, is_buy, size, slippage, reduce_only, bid, ask)
             .await?;
 
-        let exchange_url = if let Some(dex) = Self::dex_from_coin(coin) {
-            format!("{}?dex={}", self.exchange_url, dex)
-        } else {
-            self.exchange_url.clone()
-        };
-
         // Send order via REST API
         debug!("[HYPERLIQUID] Sending order to exchange");
         let response = self
             .client
-            .post(&exchange_url)
+            .post(&self.exchange_url)
             .json(&payload)
             .send()
             .await
