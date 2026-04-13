@@ -296,7 +296,8 @@ impl BinanceTrading {
             );
         }
 
-        let client_id = format!("xemm-{}", Uuid::new_v4().simple());
+        // Binance enforces newClientOrderId length <= 36.
+        let client_id = format!("xl-{}", Uuid::new_v4().simple());
         let side_str = match side {
             MakerOrderSide::Buy => "BUY",
             MakerOrderSide::Sell => "SELL",
@@ -346,7 +347,8 @@ impl BinanceTrading {
             bail!("Rounded Binance market qty is invalid: {}", rounded_qty);
         }
 
-        let client_id = format!("xemm-mkt-{}", Uuid::new_v4().simple());
+        // Binance enforces newClientOrderId length <= 36.
+        let client_id = format!("xm-{}", Uuid::new_v4().simple());
         let side_str = match side {
             MakerOrderSide::Buy => "BUY",
             MakerOrderSide::Sell => "SELL",
