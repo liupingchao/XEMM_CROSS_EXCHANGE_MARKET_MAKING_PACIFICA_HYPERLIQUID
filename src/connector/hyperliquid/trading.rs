@@ -459,7 +459,7 @@ impl HyperliquidTrading {
             nonce,
             signature,
             vaultAddress: None,
-            dex: Self::dex_from_coin(coin).map(str::to_string),
+            dex: None,
         })
     }
 
