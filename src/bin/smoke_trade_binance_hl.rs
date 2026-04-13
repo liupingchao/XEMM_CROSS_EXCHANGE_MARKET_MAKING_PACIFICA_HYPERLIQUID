@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
 
     let binance = BinanceTrading::new(binance_creds, false)?;
     let hl = HyperliquidTrading::new(hl_creds, false)?;
+    info!("[HYPERLIQUID] signer wallet: {}", hl.get_wallet_address());
 
     // Read-only connectivity checks
     let binance_tob = if skip_binance {
