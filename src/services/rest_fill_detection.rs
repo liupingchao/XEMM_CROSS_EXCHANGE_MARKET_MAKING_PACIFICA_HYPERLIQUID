@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -8,8 +8,8 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::audit_logger;
-use crate::bot::BotState;
-use crate::connector::maker::{MakerExchange, MakerOrderSide};
+use crate::bot::{ActiveOrder, BotState, PendingOrder};
+use crate::connector::maker::MakerExchange;
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
 use crate::util::rate_limit::is_rate_limit_error;
@@ -38,11 +38,9 @@ impl RestFillDetectionService {
         let mut keys = Vec::new();
         if let Some(order_id) = exchange_order_id {
             keys.push(format!("full_{}", order_id));
-            keys.push(format!("partial_{}", order_id));
         }
         if let Some(cloid) = client_order_id {
             keys.push(format!("full_{}", cloid));
-            keys.push(format!("partial_{}", cloid));
         }
         keys.iter().any(|k| processed.contains(k))
     }
@@ -89,6 +87,25 @@ impl RestFillDetectionService {
         }
     }
 
+    fn tracked_order_key(order: &ActiveOrder) -> String {
+        order
+            .exchange_order_id
+            .clone()
+            .unwrap_or_else(|| order.client_order_id.clone())
+    }
+
+    fn open_order_matches_tracked(
+        tracked: &ActiveOrder,
+        open: &crate::connector::maker::MakerOpenOrder,
+    ) -> bool {
+        open.client_order_id == tracked.client_order_id
+            || tracked
+                .exchange_order_id
+                .as_ref()
+                .map(|id| open.order_id.as_deref() == Some(id.as_str()))
+                .unwrap_or(false)
+    }
+
     async fn emit_fill_and_trigger_hedge(
         &self,
         order_side: OrderSide,
@@ -98,6 +115,7 @@ impl RestFillDetectionService {
         client_order_id: Option<String>,
         is_full_fill: bool,
         source: &str,
+        filled_order: Option<ActiveOrder>,
     ) {
         let fills_csv = audit_logger::fill_file_for_symbol(&self.symbol);
         let fill_record = audit_logger::FillRecord::new(
@@ -118,6 +136,9 @@ impl RestFillDetectionService {
 
         {
             let mut state = self.bot_state.write().await;
+            if let Some(order) = filled_order {
+                state.active_order = Some(order);
+            }
             state.mark_filled(fill_size, order_side);
         }
 
@@ -230,6 +251,7 @@ impl RestFillDetectionService {
             client_order_id.map(ToString::to_string),
             true,
             "rest_trade_history_recovery",
+            None,
         )
         .await;
 
@@ -238,26 +260,27 @@ impl RestFillDetectionService {
 
     pub async fn run(self) {
         let mut consecutive_errors = 0u32;
-        let mut last_known_filled_amount: f64 = 0.0;
+        let mut last_known_filled_amounts: HashMap<String, f64> = HashMap::new();
+        let mut hedged_filled_amounts: HashMap<String, f64> = HashMap::new();
 
         loop {
-            let has_active_order = {
+            let has_pending_orders = {
                 let state = self.bot_state.read().await;
-                state.has_active_order_fast()
+                !state.pending_orders_for_symbol(&self.symbol).is_empty()
                     || matches!(
                         state.status,
                         crate::bot::BotStatus::Filled | crate::bot::BotStatus::Hedging
                     )
             };
 
-            let poll_ms = if has_active_order {
+            let poll_ms = if has_pending_orders {
                 self.poll_interval_ms
             } else {
                 1000
             };
             tokio::time::sleep(Duration::from_millis(poll_ms)).await;
 
-            let active_order_info = {
+            let tracked_orders: Vec<PendingOrder> = {
                 let state = self.bot_state.read().await;
 
                 if matches!(
@@ -268,144 +291,184 @@ impl RestFillDetectionService {
                     continue;
                 }
 
-                if let Some(ref order) = state.active_order {
-                    Some((
-                        order.client_order_id.clone(),
-                        order.exchange_order_id.clone(),
-                        order.side,
-                    ))
+                let pending = state.pending_orders_for_symbol(&self.symbol);
+                if !pending.is_empty() {
+                    pending
                 } else if matches!(
                     state.status,
                     crate::bot::BotStatus::Filled | crate::bot::BotStatus::Hedging
                 ) {
-                    None
+                    Vec::new()
                 } else {
-                    last_known_filled_amount = 0.0;
+                    last_known_filled_amounts.clear();
+                    hedged_filled_amounts.clear();
                     continue;
                 }
             };
 
-            let client_order_id_opt = active_order_info.as_ref().map(|(id, _, _)| id.clone());
-            let exchange_order_id_opt = active_order_info
-                .as_ref()
-                .and_then(|(_, order_id, _)| order_id.clone());
-            let order_side_opt = active_order_info.as_ref().map(|(_, _, side)| *side);
+            let tracked_keys: HashSet<String> = tracked_orders
+                .iter()
+                .map(|p| Self::tracked_order_key(&p.order))
+                .collect();
+            last_known_filled_amounts.retain(|k, _| tracked_keys.contains(k));
+            hedged_filled_amounts.retain(|k, _| tracked_keys.contains(k));
 
-            let open_orders_result = self
-                .maker_exchange
-                .get_open_orders(Some(&self.symbol))
-                .await;
+            if tracked_orders.is_empty() {
+                continue;
+            }
+
+            let open_orders_result = self.maker_exchange.get_open_orders(Some(&self.symbol)).await;
 
             match open_orders_result {
                 Ok(orders) => {
                     consecutive_errors = 0;
 
-                    let our_order = if let Some(ref cloid) = client_order_id_opt {
-                        orders.iter().find(|o| &o.client_order_id == cloid)
-                    } else {
-                        debug!(
-                            "[REST_FILL_DETECTION] Recovery mode: searching {} orders for filled orders",
-                            orders.len()
-                        );
-                        orders.iter().find(|o| o.filled_amount > 0.0)
-                    };
+                    for tracked in tracked_orders {
+                        let tracked_order = tracked.order.clone();
+                        let tracked_key = Self::tracked_order_key(&tracked_order);
+                        let last_known = *last_known_filled_amounts.get(&tracked_key).unwrap_or(&0.0);
 
-                    if let Some(order) = our_order {
-                        let filled_amount = order.filled_amount;
-                        let initial_amount = order.initial_amount;
-                        let price = order.price;
+                        let maybe_open_order = orders
+                            .iter()
+                            .find(|o| Self::open_order_matches_tracked(&tracked_order, o))
+                            .cloned();
 
-                        if filled_amount > last_known_filled_amount && filled_amount > 0.0 {
-                            let new_fill_amount = filled_amount - last_known_filled_amount;
-                            let notional_value = new_fill_amount * price;
+                        if let Some(open_order) = maybe_open_order {
+                            let filled_amount = open_order.filled_amount;
+                            let initial_amount = open_order.initial_amount;
+                            let price = open_order.price;
+                            let hedged_so_far =
+                                *hedged_filled_amounts.get(&tracked_key).unwrap_or(&0.0);
 
-                            debug!(
-                                "[REST_FILL_DETECTION] Fill detected: {} -> {} (new: {}) | Notional: ${:.2}",
-                                last_known_filled_amount, filled_amount, new_fill_amount, notional_value
-                            );
+                            if filled_amount > last_known && filled_amount > 0.0 {
+                                let new_fill_amount = filled_amount - last_known;
+                                let new_fill_notional = new_fill_amount * price;
+                                // Hedge against cumulative unhedged exposure rather than just the latest delta.
+                                let hedge_fill_amount = (filled_amount - hedged_so_far).max(0.0);
+                                let hedge_notional = hedge_fill_amount * price;
 
-                            last_known_filled_amount = filled_amount;
-                            let is_full_fill = (filled_amount - initial_amount).abs() < 0.0001;
-
-                            if is_full_fill || notional_value > self.min_hedge_notional {
-                                let cloid = &order.client_order_id;
-
-                                if self.is_fill_already_processed(order.order_id.as_deref(), Some(cloid)) {
-                                    debug!("[REST_FILL_DETECTION] Fill already processed, skipping");
-                                    continue;
-                                }
-                                self.mark_fill_processed(
-                                    order.order_id.as_deref(),
-                                    Some(cloid),
-                                    is_full_fill,
-                                    "rest",
-                                );
-
-                                let order_side = if let Some(side) = order_side_opt {
-                                    side
-                                } else {
-                                    match order.side {
-                                        MakerOrderSide::Buy => OrderSide::Buy,
-                                        MakerOrderSide::Sell => OrderSide::Sell,
-                                    }
-                                };
-
-                                info!(
-                                    "{} {} {} FILL: {} {} {} @ {} | Filled: {} / {} | Notional: {} {}",
-                                    "[REST_FILL_DETECTION]".bright_cyan().bold(),
-                                    "✓".green().bold(),
-                                    if is_full_fill { "FULL" } else { "PARTIAL" },
-                                    order.side.as_str().bright_yellow(),
-                                    filled_amount,
-                                    self.symbol.bright_white().bold(),
-                                    format!("${:.6}", price).cyan(),
-                                    filled_amount,
-                                    initial_amount,
-                                    format!("${:.2}", notional_value).cyan().bold(),
-                                    "(REST API)".bright_black()
-                                );
-
-                                self.emit_fill_and_trigger_hedge(
-                                    order_side,
-                                    new_fill_amount,
-                                    price,
-                                    order.order_id.clone(),
-                                    Some(order.client_order_id.clone()),
-                                    is_full_fill,
-                                    "rest_fill_detection",
-                                )
-                                .await;
-                            } else {
                                 debug!(
-                                    "[REST_FILL_DETECTION] Fill notional ${:.2} < ${:.2} threshold, skipping",
-                                    notional_value, self.min_hedge_notional
+                                    "[REST_FILL_DETECTION] Fill detected: {} -> {} (new: {}, unhedged: {}) | Notional(new): ${:.2}, Notional(unhedged): ${:.2} | cloid={}",
+                                    last_known,
+                                    filled_amount,
+                                    new_fill_amount,
+                                    hedge_fill_amount,
+                                    new_fill_notional,
+                                    hedge_notional,
+                                    tracked_order.client_order_id
                                 );
+
+                                last_known_filled_amounts.insert(tracked_key.clone(), filled_amount);
+                                let is_full_fill = (filled_amount - initial_amount).abs() < 0.0001
+                                    || (filled_amount + 1e-9) >= tracked_order.size;
+
+                                if is_full_fill || hedge_notional > self.min_hedge_notional {
+                                    if hedge_fill_amount <= 0.0 {
+                                        debug!(
+                                            "[REST_FILL_DETECTION] Unhedged amount is non-positive ({}), skipping hedge trigger",
+                                            hedge_fill_amount
+                                        );
+                                        continue;
+                                    }
+
+                                    let cloid = &open_order.client_order_id;
+                                    if self.is_fill_already_processed(
+                                        open_order.order_id.as_deref(),
+                                        Some(cloid),
+                                    ) {
+                                        debug!("[REST_FILL_DETECTION] Fill already processed, skipping");
+                                        continue;
+                                    }
+
+                                    self.mark_fill_processed(
+                                        open_order.order_id.as_deref(),
+                                        Some(cloid),
+                                        is_full_fill,
+                                        "rest",
+                                    );
+
+                                    info!(
+                                        "{} {} {} FILL: {} {} {} @ {} | Filled: {} / {} | Notional: {} {}",
+                                        "[REST_FILL_DETECTION]".bright_cyan().bold(),
+                                        "✓".green().bold(),
+                                        if is_full_fill { "FULL" } else { "PARTIAL" },
+                                        tracked_order.side.as_str().bright_yellow(),
+                                        filled_amount,
+                                        self.symbol.bright_white().bold(),
+                                        format!("${:.6}", price).cyan(),
+                                        filled_amount,
+                                        initial_amount,
+                                        format!("${:.2}", hedge_notional).cyan().bold(),
+                                        "(REST API)".bright_black()
+                                    );
+
+                                    if is_full_fill {
+                                        let mut state = self.bot_state.write().await;
+                                        state.remove_pending_order(
+                                            Some(&tracked_order.client_order_id),
+                                            tracked_order.exchange_order_id.as_deref(),
+                                        );
+                                        last_known_filled_amounts.remove(&tracked_key);
+                                        hedged_filled_amounts.remove(&tracked_key);
+                                    }
+
+                                    self.emit_fill_and_trigger_hedge(
+                                        tracked_order.side,
+                                        hedge_fill_amount,
+                                        price,
+                                        open_order.order_id.clone(),
+                                        Some(open_order.client_order_id.clone()),
+                                        is_full_fill,
+                                        "rest_fill_detection",
+                                        Some(tracked_order.clone()),
+                                    )
+                                    .await;
+                                    if !is_full_fill {
+                                        hedged_filled_amounts.insert(tracked_key.clone(), filled_amount);
+                                    }
+                                } else {
+                                    debug!(
+                                        "[REST_FILL_DETECTION] Fill notional ${:.2} < ${:.2} threshold, skipping",
+                                        hedge_notional, self.min_hedge_notional
+                                    );
+                                }
                             }
+                            continue;
                         }
-                    } else if client_order_id_opt.is_some() {
-                        if let (Some(order_id), Some(order_side)) =
-                            (exchange_order_id_opt.as_deref(), order_side_opt)
-                        {
+
+                        if let Some(order_id) = tracked_order.exchange_order_id.as_deref() {
                             match self
                                 .recover_fill_via_trade_history(
                                     order_id,
-                                    client_order_id_opt.as_deref(),
-                                    order_side,
+                                    Some(&tracked_order.client_order_id),
+                                    tracked_order.side,
                                 )
                                 .await
                             {
                                 Ok(true) => {
-                                    last_known_filled_amount = 0.0;
+                                    last_known_filled_amounts.remove(&tracked_key);
+                                    hedged_filled_amounts.remove(&tracked_key);
+                                    let mut state = self.bot_state.write().await;
+                                    state.remove_pending_order(
+                                        Some(&tracked_order.client_order_id),
+                                        Some(order_id),
+                                    );
                                     continue;
                                 }
                                 Ok(false) => {}
                                 Err(e) => debug!(
-                                    "[REST_FILL_DETECTION] Trade history recovery failed: {}",
-                                    e
+                                    "[REST_FILL_DETECTION] Trade history recovery failed (cloid={}): {}",
+                                    tracked_order.client_order_id, e
                                 ),
                             }
                         }
-                        debug!("[REST_FILL_DETECTION] Active order not found in open_orders");
+
+                        debug!(
+                            "[REST_FILL_DETECTION] Pending order not found in open orders: cloid={} oid={} cancel_requested={}",
+                            tracked_order.client_order_id,
+                            tracked_order.exchange_order_id.as_deref().unwrap_or("-"),
+                            tracked.cancel_requested
+                        );
                     }
                 }
                 Err(e) => {

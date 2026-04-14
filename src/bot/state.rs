@@ -41,11 +41,38 @@ pub struct ActiveOrder {
     pub placed_at: Instant,
 }
 
+/// Order tracked for asynchronous fill/cancel reconciliation.
+#[derive(Debug, Clone)]
+pub struct PendingOrder {
+    /// Original order payload tracked by the bot.
+    pub order: ActiveOrder,
+    /// Whether cancellation was requested for this order.
+    pub cancel_requested: bool,
+}
+
+impl PendingOrder {
+    fn matches_ids(&self, client_order_id: Option<&str>, exchange_order_id: Option<&str>) -> bool {
+        if client_order_id.is_none() && exchange_order_id.is_none() {
+            return false;
+        }
+
+        let client_match = client_order_id
+            .map(|id| self.order.client_order_id == id)
+            .unwrap_or(false);
+        let exchange_match = exchange_order_id
+            .map(|id| self.order.exchange_order_id.as_deref() == Some(id))
+            .unwrap_or(false);
+        client_match || exchange_match
+    }
+}
+
 /// Bot state (thread-safe via Arc<RwLock<BotState>>)
 #[derive(Debug)]
 pub struct BotState {
     /// Currently active order (if any)
     pub active_order: Option<ActiveOrder>,
+    /// All recently placed maker orders waiting for final fill/cancel confirmation.
+    pub pending_orders: Vec<PendingOrder>,
     /// Current position size (+ for long, - for short, 0 for flat)
     pub position: f64,
     /// Current bot status
@@ -61,6 +88,7 @@ impl BotState {
     pub fn new() -> Self {
         Self {
             active_order: None,
+            pending_orders: Vec::new(),
             position: 0.0,
             status: BotStatus::Idle,
             status_atomic: Arc::new(AtomicU8::new(0)), // 0 = Idle
@@ -70,9 +98,79 @@ impl BotState {
 
     /// Set active order and update status
     pub fn set_active_order(&mut self, order: ActiveOrder) {
+        self.upsert_pending_order(order.clone());
         self.active_order = Some(order);
         self.status = BotStatus::OrderPlaced;
         self.status_atomic.store(1, Ordering::Release); // 1 = OrderPlaced
+    }
+
+    /// Insert/update a pending tracked order.
+    pub fn upsert_pending_order(&mut self, order: ActiveOrder) {
+        if let Some(existing) = self
+            .pending_orders
+            .iter_mut()
+            .find(|p| p.matches_ids(Some(&order.client_order_id), order.exchange_order_id.as_deref()))
+        {
+            existing.order = order;
+            existing.cancel_requested = false;
+            return;
+        }
+
+        self.pending_orders.push(PendingOrder {
+            order,
+            cancel_requested: false,
+        });
+    }
+
+    /// Snapshot tracked pending orders for a specific symbol.
+    pub fn pending_orders_for_symbol(&self, symbol: &str) -> Vec<PendingOrder> {
+        self.pending_orders
+            .iter()
+            .filter(|p| p.order.symbol.eq_ignore_ascii_case(symbol))
+            .cloned()
+            .collect()
+    }
+
+    /// Find a pending order by client order id or exchange order id.
+    pub fn find_pending_order(
+        &self,
+        client_order_id: Option<&str>,
+        exchange_order_id: Option<&str>,
+    ) -> Option<PendingOrder> {
+        self.pending_orders
+            .iter()
+            .find(|p| p.matches_ids(client_order_id, exchange_order_id))
+            .cloned()
+    }
+
+    /// Mark pending orders as cancellation-requested.
+    pub fn mark_cancel_requested_for_symbol(&mut self, symbol: &str) {
+        for pending in self
+            .pending_orders
+            .iter_mut()
+            .filter(|p| p.order.symbol.eq_ignore_ascii_case(symbol))
+        {
+            pending.cancel_requested = true;
+        }
+    }
+
+    /// Remove a pending order by client/exchange id.
+    pub fn remove_pending_order(
+        &mut self,
+        client_order_id: Option<&str>,
+        exchange_order_id: Option<&str>,
+    ) -> Option<PendingOrder> {
+        let idx = self
+            .pending_orders
+            .iter()
+            .position(|p| p.matches_ids(client_order_id, exchange_order_id))?;
+        Some(self.pending_orders.remove(idx))
+    }
+
+    /// Remove all pending orders for a symbol.
+    pub fn clear_pending_orders_for_symbol(&mut self, symbol: &str) {
+        self.pending_orders
+            .retain(|p| !p.order.symbol.eq_ignore_ascii_case(symbol));
     }
 
     /// Clear active order and return to Idle
@@ -106,6 +204,7 @@ impl BotState {
         self.status = BotStatus::Complete;
         self.status_atomic.store(4, Ordering::Release); // 4 = Complete
         self.active_order = None;
+        self.pending_orders.clear();
     }
 
     /// Set error status

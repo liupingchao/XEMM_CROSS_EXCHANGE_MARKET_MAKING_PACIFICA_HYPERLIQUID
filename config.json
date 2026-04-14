@@ -9,7 +9,10 @@
   "order_notional_usd": 20.0,
   "profit_cancel_threshold_bps": 3.0,
   "order_refresh_interval_secs": 60,
+  "evaluation_loop_interval_ms": 50,
+  "order_failure_cooldown_ms": 1500,
+  "post_only_reject_cooldown_ms": 6000,
   "hyperliquid_slippage": 0.05,
   "pacifica_rest_poll_interval_secs": 2,
-  "pacifica_active_order_rest_poll_interval_ms": 250
+  "pacifica_active_order_rest_poll_interval_ms": 500
 }

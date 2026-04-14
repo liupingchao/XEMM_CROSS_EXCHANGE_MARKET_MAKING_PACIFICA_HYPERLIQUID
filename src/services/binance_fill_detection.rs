@@ -104,30 +104,19 @@ impl BinanceFillDetectionService {
                                 .or_else(|| order_id.clone())
                                 .unwrap_or_else(|| "unknown".to_string());
 
-                            let (is_our_order, strategy_side, expected_order_size) = {
+                            let tracked_order = {
                                 let state = bot_state.read().await;
-                                let Some(active) = state.active_order.as_ref() else {
-                                    return;
-                                };
-
-                                let client_match = client_order_id
-                                    .as_ref()
-                                    .map(|id| &active.client_order_id == id)
-                                    .unwrap_or(false);
-                                let order_match = order_id
-                                    .as_ref()
-                                    .map(|id| active.exchange_order_id.as_deref() == Some(id.as_str()))
-                                    .unwrap_or(false);
-                                (
-                                    client_match || order_match,
-                                    active.side,
-                                    active.size,
+                                state.find_pending_order(
+                                    client_order_id.as_deref(),
+                                    order_id.as_deref(),
                                 )
                             };
 
-                            if !is_our_order {
+                            let Some(tracked_order) = tracked_order else {
                                 return;
-                            }
+                            };
+                            let strategy_side = tracked_order.order.side;
+                            let expected_order_size = tracked_order.order.size;
 
                             let incremental_fill = {
                                 let mut map = cumulative_fill_state.lock();
@@ -166,19 +155,19 @@ impl BinanceFillDetectionService {
                                 return;
                             }
 
-                            let fill_id = if is_full_fill {
-                                format!("full_{}", key)
-                            } else {
-                                format!("partial_{}", key)
-                            };
+                            let event_fill_id =
+                                format!("binance_stream_{}_{}", key, cumulative_fill_qty);
                             {
                                 let mut processed = processed_fills.lock();
-                                if processed.contains(&fill_id)
-                                    || processed.contains(&format!("full_{}", key))
-                                {
+                                if processed.contains(&event_fill_id) {
                                     return;
                                 }
-                                processed.insert(fill_id);
+                                processed.insert(event_fill_id);
+                                if is_full_fill {
+                                    processed.insert(format!("full_{}", key));
+                                } else {
+                                    processed.insert(format!("partial_{}", key));
+                                }
                             }
 
                             info!(
@@ -222,6 +211,13 @@ impl BinanceFillDetectionService {
                                 if matches!(state.status, BotStatus::Complete | BotStatus::Error(_)) {
                                     return;
                                 }
+                                if is_full_fill {
+                                    state.remove_pending_order(
+                                        client_order_id.as_deref(),
+                                        order_id.as_deref(),
+                                    );
+                                }
+                                state.active_order = Some(tracked_order.order.clone());
                                 state.mark_filled(incremental_fill, order_side);
                             }
 
@@ -247,7 +243,11 @@ impl BinanceFillDetectionService {
                             }
 
                             let mut state = bot_state.write().await;
-                            let is_our_order = state
+                            let removed = state.remove_pending_order(
+                                client_order_id.as_deref(),
+                                order_id.as_deref(),
+                            );
+                            let is_active_order = state
                                 .active_order
                                 .as_ref()
                                 .map(|o| {
@@ -261,7 +261,7 @@ impl BinanceFillDetectionService {
                                             .unwrap_or(false)
                                 })
                                 .unwrap_or(false);
-                            if is_our_order && matches!(state.status, BotStatus::OrderPlaced) {
+                            if removed.is_some() && is_active_order && matches!(state.status, BotStatus::OrderPlaced) {
                                 state.clear_active_order();
                                 debug!("[BINANCE_FILL] Active order cancelled via stream");
                             }

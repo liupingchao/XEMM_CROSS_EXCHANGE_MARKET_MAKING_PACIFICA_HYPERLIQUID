@@ -103,6 +103,13 @@ pub trait MakerExchange: Send + Sync {
         current_bid: Option<f64>,
         current_ask: Option<f64>,
     ) -> Result<MakerOrderData>;
+    async fn place_market_order(
+        &self,
+        symbol: &str,
+        side: MakerOrderSide,
+        size: f64,
+        reduce_only: bool,
+    ) -> Result<MakerOrderData>;
     async fn cancel_all_orders(&self, symbol: Option<&str>) -> Result<u32>;
     async fn get_open_orders(&self, symbol: Option<&str>) -> Result<Vec<MakerOpenOrder>>;
     async fn get_positions(&self, symbol: Option<&str>) -> Result<Vec<MakerPosition>>;
@@ -185,6 +192,31 @@ impl MakerExchange for PacificaMakerExchange {
 
     async fn cancel_all_orders(&self, symbol: Option<&str>) -> Result<u32> {
         self.inner.cancel_all_orders(false, symbol, false).await
+    }
+
+    async fn place_market_order(
+        &self,
+        symbol: &str,
+        side: MakerOrderSide,
+        size: f64,
+        reduce_only: bool,
+    ) -> Result<MakerOrderData> {
+        let pac_side = match side {
+            MakerOrderSide::Buy => PacificaOrderSide::Buy,
+            MakerOrderSide::Sell => PacificaOrderSide::Sell,
+        };
+
+        // Pacifica market orders need explicit slippage. Keep this conservative for flattening.
+        let order = self
+            .inner
+            .place_market_order(symbol, pac_side, size, 0.05, reduce_only)
+            .await?;
+
+        Ok(MakerOrderData {
+            order_id: order.order_id.map(|v| v.to_string()),
+            client_order_id: order.client_order_id,
+            symbol: order.symbol,
+        })
     }
 
     async fn get_open_orders(&self, _symbol: Option<&str>) -> Result<Vec<MakerOpenOrder>> {
@@ -298,6 +330,16 @@ impl MakerExchange for BinanceMakerExchange {
 
     async fn cancel_all_orders(&self, symbol: Option<&str>) -> Result<u32> {
         self.inner.cancel_all_orders(symbol).await
+    }
+
+    async fn place_market_order(
+        &self,
+        symbol: &str,
+        side: MakerOrderSide,
+        size: f64,
+        _reduce_only: bool,
+    ) -> Result<MakerOrderData> {
+        self.inner.place_market_order(symbol, side, size).await
     }
 
     async fn get_open_orders(&self, symbol: Option<&str>) -> Result<Vec<MakerOpenOrder>> {

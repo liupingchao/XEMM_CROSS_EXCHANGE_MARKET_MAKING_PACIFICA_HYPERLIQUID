@@ -1,7 +1,7 @@
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 use parking_lot::Mutex;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
 use tracing::{debug, info, warn};
@@ -46,8 +46,9 @@ impl From<&BotStatus> for AtomicBotStatus {
 // ============================================================================
 
 /// Minimal order data needed for monitoring (avoids full clone)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct OrderSnapshot {
+    pub client_order_id: String,
     pub side: OrderSide,
     pub price: f64,
     pub size: f64,
@@ -70,7 +71,7 @@ impl SharedOrderSnapshot {
 
     #[inline]
     pub fn get(&self) -> Option<OrderSnapshot> {
-        *self.inner.lock()
+        self.inner.lock().clone()
     }
 
     #[inline]
@@ -87,9 +88,20 @@ impl SharedOrderSnapshot {
 #[derive(Debug)]
 pub enum CancelRequest {
     /// Cancel due to age expiry
-    AgeExpiry { symbol: String, reason: String },
+    AgeExpiry {
+        symbol: String,
+        reason: String,
+        client_order_id: String,
+        placed_at: Instant,
+    },
     /// Cancel due to profit deviation
-    ProfitDeviation { symbol: String, current_profit_bps: f64, deviation_bps: f64 },
+    ProfitDeviation {
+        symbol: String,
+        current_profit_bps: f64,
+        deviation_bps: f64,
+        client_order_id: String,
+        placed_at: Instant,
+    },
 }
 
 // ============================================================================
@@ -182,6 +194,15 @@ impl OrderMonitorService {
         // Timing thresholds
         let age_threshold = Duration::from_secs(self.config.order_refresh_interval_secs);
         let profit_threshold = self.config.profit_cancel_threshold_bps;
+        // Reduce churn: once age threshold is reached, wait 3s then evaluate.
+        let age_cancel_decision_grace = Duration::from_secs(3);
+        // Keep waiting if current edge drift is still small.
+        let age_cancel_keep_waiting_deviation_bps = 10.0_f64;
+        // Hard cap to avoid waiting forever.
+        let age_cancel_hard_cap = age_threshold + Duration::from_secs(120);
+        let mut tracked_client_order_id: Option<String> = None;
+        let mut age_threshold_reached_at: Option<Instant> = None;
+        let mut age_cancel_sent_for_current_order = false;
 
         loop {
             monitor_interval.tick().await;
@@ -197,6 +218,14 @@ impl OrderMonitorService {
                 Some(s) => s,
                 None => continue,
             };
+            if tracked_client_order_id
+                .as_deref()
+                != Some(snapshot.client_order_id.as_str())
+            {
+                tracked_client_order_id = Some(snapshot.client_order_id.clone());
+                age_threshold_reached_at = None;
+                age_cancel_sent_for_current_order = false;
+            }
 
             // Get prices (parking_lot mutex is very fast for uncontended case)
             let (hl_bid, hl_ask) = *self.hyperliquid_prices.lock();
@@ -205,16 +234,6 @@ impl OrderMonitorService {
             }
 
             let age = snapshot.placed_at.elapsed();
-
-            // Check 1: Age threshold
-            if age > age_threshold {
-                // Send cancel request (non-blocking)
-                let _ = self.cancel_tx.try_send(CancelRequest::AgeExpiry {
-                    symbol: self.maker_symbol.clone(),
-                    reason: format!("age {}ms > {}s threshold", age.as_millis(), self.config.order_refresh_interval_secs),
-                });
-                continue;
-            }
 
             // Check 2: Profit deviation (using raw method - no allocation)
             let current_profit = self.evaluator.recalculate_profit_raw(
@@ -228,12 +247,62 @@ impl OrderMonitorService {
             let profit_change = snapshot.initial_profit_bps - current_profit;
             let profit_deviation = profit_change.abs();
 
+            // Check 1: Age threshold with anti-churn logic
+            if age > age_threshold {
+                let since = age_threshold_reached_at.get_or_insert_with(Instant::now);
+                let decision_elapsed = since.elapsed();
+                let should_keep_waiting = profit_deviation <= age_cancel_keep_waiting_deviation_bps;
+                let hit_hard_cap = age >= age_cancel_hard_cap;
+
+                if age_cancel_sent_for_current_order {
+                    continue;
+                }
+
+                if decision_elapsed < age_cancel_decision_grace {
+                    continue;
+                }
+
+                if should_keep_waiting && !hit_hard_cap {
+                    continue;
+                }
+
+                let reason = if hit_hard_cap {
+                    format!(
+                        "age hard cap {}s reached (age={}ms, deviation={:.2} bps)",
+                        age_cancel_hard_cap.as_secs(),
+                        age.as_millis(),
+                        profit_deviation
+                    )
+                } else {
+                    format!(
+                        "age {}ms > {}s threshold and deviation {:.2} bps > {:.2} bps",
+                        age.as_millis(),
+                        self.config.order_refresh_interval_secs,
+                        profit_deviation,
+                        age_cancel_keep_waiting_deviation_bps
+                    )
+                };
+
+                let _ = self.cancel_tx.try_send(CancelRequest::AgeExpiry {
+                    symbol: self.maker_symbol.clone(),
+                    reason,
+                    client_order_id: snapshot.client_order_id.clone(),
+                    placed_at: snapshot.placed_at,
+                });
+                age_cancel_sent_for_current_order = true;
+                continue;
+            } else {
+                age_threshold_reached_at = None;
+            }
+
             if profit_deviation > profit_threshold {
                 // Send cancel request (non-blocking)
                 let _ = self.cancel_tx.try_send(CancelRequest::ProfitDeviation {
                     symbol: self.maker_symbol.clone(),
                     current_profit_bps: current_profit,
                     deviation_bps: profit_deviation,
+                    client_order_id: snapshot.client_order_id.clone(),
+                    placed_at: snapshot.placed_at,
                 });
             }
         }
@@ -265,11 +334,42 @@ impl OrderMonitorService {
                 continue;
             }
 
-            // Get current snapshot for logging
-            let _snapshot = self.order_snapshot.get();
+            // Skip stale cancel requests (must match current order id + placed_at)
+            let current_snapshot = match self.order_snapshot.get() {
+                Some(s) => s,
+                None => {
+                    debug!("[CANCEL] Skipping - no active order snapshot");
+                    continue;
+                }
+            };
+            let (req_symbol, req_client_order_id, req_placed_at) = match &request {
+                CancelRequest::AgeExpiry {
+                    symbol,
+                    client_order_id,
+                    placed_at,
+                    ..
+                } => (symbol.as_str(), client_order_id.as_str(), *placed_at),
+                CancelRequest::ProfitDeviation {
+                    symbol,
+                    client_order_id,
+                    placed_at,
+                    ..
+                } => (symbol.as_str(), client_order_id.as_str(), *placed_at),
+            };
+            if current_snapshot.client_order_id != req_client_order_id
+                || current_snapshot.placed_at != req_placed_at
+            {
+                debug!(
+                    "[CANCEL] Skipping stale request for {} (req={}, current={})",
+                    req_symbol,
+                    req_client_order_id,
+                    current_snapshot.client_order_id
+                );
+                continue;
+            }
 
             // Check for partial fills before cancelling
-            match self.check_for_fills().await {
+            match self.check_for_fills(req_client_order_id).await {
                 FillCheckResult::HasFills(amount) => {
                     info!(
                         "[CANCEL] Order has fills ({}) - skipping cancellation, waiting for fill detection",
@@ -292,21 +392,32 @@ impl OrderMonitorService {
 
             // Log the cancellation reason
             match &request {
-                CancelRequest::AgeExpiry { reason, .. } => {
+                CancelRequest::AgeExpiry {
+                    reason,
+                    client_order_id,
+                    ..
+                } => {
                     info!("[CANCEL] Age expiry: {}", reason);
+                    debug!("[CANCEL] target cloid={}", client_order_id);
                 }
-                CancelRequest::ProfitDeviation { current_profit_bps, deviation_bps, .. } => {
+                CancelRequest::ProfitDeviation {
+                    current_profit_bps,
+                    deviation_bps,
+                    client_order_id,
+                    ..
+                } => {
                     info!(
                         "[CANCEL] Profit deviation: current={:.2} bps, deviation={:.2} bps",
                         current_profit_bps, deviation_bps
                     );
+                    debug!("[CANCEL] target cloid={}", client_order_id);
                 }
             }
 
             // Execute cancellation
             let symbol = match &request {
-                CancelRequest::AgeExpiry { symbol, .. } => symbol,
-                CancelRequest::ProfitDeviation { symbol, .. } => symbol,
+                CancelRequest::AgeExpiry { symbol, .. } => symbol.as_str(),
+                CancelRequest::ProfitDeviation { symbol, .. } => symbol.as_str(),
             };
 
             match self.maker_exchange.cancel_all_orders(Some(symbol)).await {
@@ -315,7 +426,14 @@ impl OrderMonitorService {
                     
                     // Clear state only if still in OrderPlaced
                     let mut state = self.bot_state.write().await;
-                    if matches!(state.status, BotStatus::OrderPlaced) {
+                    if matches!(state.status, BotStatus::OrderPlaced)
+                        && state
+                            .active_order
+                            .as_ref()
+                            .map(|o| o.client_order_id.as_str() == req_client_order_id)
+                            .unwrap_or(false)
+                    {
+                        state.mark_cancel_requested_for_symbol(symbol);
                         state.clear_active_order();
                         self.atomic_status.store(AtomicBotStatus::Idle as u8, Ordering::Release);
                         self.order_snapshot.set(None);
@@ -391,18 +509,13 @@ impl OrderMonitorService {
     }
 
     /// Check if order has fills (called from cancellation handler, not hot path)
-    async fn check_for_fills(&self) -> FillCheckResult {
-        // Get client_order_id from full state (only in cancellation handler)
-        let state = self.bot_state.read().await;
-        let client_order_id = match &state.active_order {
-            Some(order) => order.client_order_id.clone(),
-            None => return FillCheckResult::NotFound,
-        };
-        drop(state);
-
+    async fn check_for_fills(&self, client_order_id: &str) -> FillCheckResult {
         match self.maker_exchange.get_open_orders(Some(&self.maker_symbol)).await {
             Ok(orders) => {
-                if let Some(order) = orders.iter().find(|o| o.client_order_id == client_order_id) {
+                if let Some(order) = orders
+                    .iter()
+                    .find(|o| o.client_order_id.as_str() == client_order_id)
+                {
                     let filled_amount = order.filled_amount;
                     if filled_amount > 0.0 {
                         FillCheckResult::HasFills(filled_amount)
@@ -467,17 +580,20 @@ pub fn sync_atomic_status(atomic: &AtomicU8, status: &BotStatus) {
 #[inline]
 pub fn update_order_snapshot(
     snapshot: &SharedOrderSnapshot,
+    client_order_id: String,
     side: OrderSide,
     price: f64,
     size: f64,
     initial_profit_bps: f64,
+    placed_at: Instant,
 ) {
     snapshot.set(Some(OrderSnapshot {
+        client_order_id,
         side,
         price,
         size,
         initial_profit_bps,
-        placed_at: Instant::now(),
+        placed_at,
     }));
 }
 

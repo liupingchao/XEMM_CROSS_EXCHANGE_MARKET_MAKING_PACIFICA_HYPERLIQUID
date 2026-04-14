@@ -35,6 +35,21 @@ use crate::services::{
 use crate::strategy::{OpportunityEvaluator, OrderSide};
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
 
+fn is_post_only_reject_error(error: &anyhow::Error) -> bool {
+    let s = error.to_string().to_ascii_lowercase();
+    s.contains("-5022")
+        || s.contains("post only")
+        || s.contains("post-only")
+        || s.contains("executed as maker")
+}
+
+fn maker_side_to_strategy_side(side: MakerOrderSide) -> OrderSide {
+    match side {
+        MakerOrderSide::Buy => OrderSide::Buy,
+        MakerOrderSide::Sell => OrderSide::Sell,
+    }
+}
+
 
 
 /// Position snapshot for tracking position deltas
@@ -147,6 +162,37 @@ impl XemmBot {
         info!("{} Order Refresh Interval: {}",
             "[CONFIG]".blue().bold(),
             format!("{} secs", config.order_refresh_interval_secs).bright_white()
+        );
+        info!("{} Evaluation Loop Interval: {}",
+            "[CONFIG]".blue().bold(),
+            format!("{} ms", config.evaluation_loop_interval_ms).bright_white()
+        );
+        info!("{} Order Failure Cooldown: {}",
+            "[CONFIG]".blue().bold(),
+            format!("{} ms", config.order_failure_cooldown_ms).bright_white()
+        );
+        info!("{} Post-only Reject Cooldown: {}",
+            "[CONFIG]".blue().bold(),
+            format!("{} ms", config.post_only_reject_cooldown_ms).bright_white()
+        );
+        info!("{} Exit/Rebalance Trigger: {}",
+            "[CONFIG]".blue().bold(),
+            if config.enable_exit_rebalance {
+                "enabled".green().bold().to_string()
+            } else {
+                "disabled".bright_black().to_string()
+            }
+        );
+        info!("{} Exit/Rebalance Thresholds: arm={} bps, exit={} bps, confirm={}s",
+            "[CONFIG]".blue().bold(),
+            format!("{:.2}", config.exit_rebalance_entry_spread_bps).bright_white(),
+            format!("{:.2}", config.exit_rebalance_exit_spread_bps).bright_white(),
+            config.exit_rebalance_confirm_secs
+        );
+        info!("{} Exit/Rebalance Position Floor: {} | Cooldown: {}s",
+            "[CONFIG]".blue().bold(),
+            format!("{:.4}", config.exit_rebalance_min_abs_position).bright_white(),
+            config.exit_rebalance_cooldown_secs
         );
         info!("{} Pacifica REST Poll Interval: {}",
             "[CONFIG]".blue().bold(),
@@ -336,6 +382,172 @@ impl XemmBot {
             shutdown_rx: Some(shutdown_rx),
             pacifica_credentials,
         })
+    }
+
+    async fn fetch_signed_positions(
+        &self,
+        maker_symbol: &str,
+        hedge_symbol: &str,
+    ) -> Result<(f64, f64)> {
+        let maker_positions = self
+            .maker_exchange
+            .get_positions(Some(maker_symbol))
+            .await
+            .with_context(|| format!("Failed to fetch {} positions", self.maker_exchange.name()))?;
+        let maker_signed = maker_positions
+            .iter()
+            .map(|p| p.signed_amount())
+            .sum::<f64>();
+
+        let hl_wallet =
+            std::env::var("HL_WALLET").unwrap_or_else(|_| self.hyperliquid_trading.get_wallet_address());
+        let user_state = self
+            .hyperliquid_trading
+            .get_user_state(&hl_wallet)
+            .await
+            .context("Failed to fetch Hyperliquid user state for exit/rebalance")?;
+        let hedge_signed = user_state
+            .asset_positions
+            .iter()
+            .find(|ap| ap.position.coin == hedge_symbol)
+            .and_then(|ap| ap.position.szi.parse::<f64>().ok())
+            .unwrap_or(0.0);
+
+        Ok((maker_signed, hedge_signed))
+    }
+
+    async fn trigger_exit_rebalance(
+        &self,
+        maker_symbol: &str,
+        hedge_symbol: &str,
+        pac_bid: f64,
+        pac_ask: f64,
+        hl_bid: f64,
+        hl_ask: f64,
+        abs_mid_spread_bps: f64,
+    ) -> Result<bool> {
+        let min_abs_pos = self.config.exit_rebalance_min_abs_position.max(0.0);
+        let (maker_pos, hedge_pos) = self
+            .fetch_signed_positions(maker_symbol, hedge_symbol)
+            .await?;
+
+        if maker_pos.abs() < min_abs_pos && hedge_pos.abs() < min_abs_pos {
+            info!(
+                "[EXIT] Triggered at {:.2} bps but already near flat (maker={:.6}, hedge={:.6}, floor={:.6})",
+                abs_mid_spread_bps,
+                maker_pos,
+                hedge_pos,
+                min_abs_pos
+            );
+            return Ok(false);
+        }
+
+        info!(
+            "[EXIT] Triggered at {:.2} bps, flattening positions | maker={:.6}, hedge={:.6}",
+            abs_mid_spread_bps,
+            maker_pos,
+            hedge_pos
+        );
+
+        if let Err(e) = self.maker_exchange.cancel_all_orders(Some(maker_symbol)).await {
+            info!(
+                "[EXIT] {} Failed to cancel maker orders before flatten: {}",
+                "⚠".yellow().bold(),
+                e
+            );
+        }
+
+        if maker_pos.abs() >= min_abs_pos {
+            let maker_side = if maker_pos > 0.0 {
+                MakerOrderSide::Sell
+            } else {
+                MakerOrderSide::Buy
+            };
+            let maker_size = maker_pos.abs();
+            let maker_price_hint = if matches!(maker_side, MakerOrderSide::Buy) {
+                pac_ask
+            } else {
+                pac_bid
+            };
+
+            let maker_order = self
+                .maker_exchange
+                .place_market_order(maker_symbol, maker_side, maker_size, true)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed maker exit market order ({} {} {})",
+                        self.maker_exchange.name(),
+                        maker_side.as_str(),
+                        maker_size
+                    )
+                })?;
+
+            let order_csv = audit_logger::order_file_for_symbol(maker_symbol);
+            let order_record = audit_logger::OrderRecord::new(
+                chrono::Utc::now(),
+                maker_symbol.to_string(),
+                self.maker_exchange.name().to_string(),
+                maker_side_to_strategy_side(maker_side),
+                maker_size,
+                maker_price_hint.max(0.0),
+                maker_order.order_id.clone(),
+                maker_order.client_order_id.clone(),
+                "exit_rebalance_market_flatten".to_string(),
+            );
+            if let Err(e) = audit_logger::log_order(&order_csv, &order_record) {
+                info!("[EXIT] {} Failed to log maker exit order: {}", "⚠".yellow().bold(), e);
+            }
+        }
+
+        if hedge_pos.abs() >= min_abs_pos {
+            let hl_is_buy = hedge_pos < 0.0;
+            let hl_side = if hl_is_buy {
+                OrderSide::Buy
+            } else {
+                OrderSide::Sell
+            };
+            let hl_size = hedge_pos.abs();
+            let hl_price_hint = if hl_is_buy { hl_ask } else { hl_bid };
+
+            self.hyperliquid_trading
+                .place_market_order(
+                    hedge_symbol,
+                    hl_is_buy,
+                    hl_size,
+                    self.config.hyperliquid_slippage,
+                    true, // reduce_only for flatten
+                    Some(hl_bid),
+                    Some(hl_ask),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "Failed Hyperliquid exit market order ({} {} {})",
+                        hedge_symbol,
+                        if hl_is_buy { "BUY" } else { "SELL" },
+                        hl_size
+                    )
+                })?;
+
+            let order_csv = audit_logger::order_file_for_symbol(hedge_symbol);
+            let order_record = audit_logger::OrderRecord::new(
+                chrono::Utc::now(),
+                hedge_symbol.to_string(),
+                "Hyperliquid".to_string(),
+                hl_side,
+                hl_size,
+                hl_price_hint.max(0.0),
+                None,
+                None,
+                "exit_rebalance_market_flatten".to_string(),
+            );
+            if let Err(e) = audit_logger::log_order(&order_csv, &order_record) {
+                info!("[EXIT] {} Failed to log hedge exit order: {}", "⚠".yellow().bold(), e);
+            }
+        }
+
+        Ok(true)
     }
 
     /// Run the bot - spawn all services and execute main loop
@@ -550,8 +762,14 @@ impl XemmBot {
         );
         info!("");
 
-        let mut eval_interval = interval(Duration::from_millis(1));
+        let mut eval_interval = interval(Duration::from_millis(
+            self.config.evaluation_loop_interval_ms.max(1),
+        ));
         let mut order_placement_rate_limit = RateLimitTracker::new();
+        let mut next_order_attempt_allowed_at = Instant::now();
+        let mut exit_rebalance_armed = false;
+        let mut exit_rebalance_below_threshold_since: Option<Instant> = None;
+        let mut next_exit_rebalance_allowed_at = Instant::now();
 
         let sigint = signal::ctrl_c();
         tokio::pin!(sigint);
@@ -615,6 +833,9 @@ impl XemmBot {
                         }
                         continue;
                     }
+                    if Instant::now() < next_order_attempt_allowed_at {
+                        continue;
+                    }
 
                     // Get current prices
                     let (pac_bid, pac_ask) = *self.pacifica_prices.lock();
@@ -623,6 +844,104 @@ impl XemmBot {
                     // Validate prices
                     if pac_bid == 0.0 || pac_ask == 0.0 || hl_bid == 0.0 || hl_ask == 0.0 {
                         continue;
+                    }
+
+                    let pac_mid = (pac_bid + pac_ask) / 2.0;
+                    let hl_mid = (hl_bid + hl_ask) / 2.0;
+                    if hl_mid <= 0.0 {
+                        continue;
+                    }
+                    let abs_mid_spread_bps = (((pac_mid - hl_mid) / hl_mid) * 10000.0).abs();
+
+                    if self.config.enable_exit_rebalance {
+                        if !exit_rebalance_armed
+                            && abs_mid_spread_bps >= self.config.exit_rebalance_entry_spread_bps
+                        {
+                            exit_rebalance_armed = true;
+                            exit_rebalance_below_threshold_since = None;
+                            info!(
+                                "[EXIT] Armed at {:.2} bps (threshold {:.2} bps)",
+                                abs_mid_spread_bps,
+                                self.config.exit_rebalance_entry_spread_bps
+                            );
+                        }
+
+                        if exit_rebalance_armed {
+                            if abs_mid_spread_bps <= self.config.exit_rebalance_exit_spread_bps {
+                                if exit_rebalance_below_threshold_since.is_none() {
+                                    exit_rebalance_below_threshold_since = Some(Instant::now());
+                                    info!(
+                                        "[EXIT] Spread back to {:.2} bps (<= {:.2}), waiting {}s confirmation",
+                                        abs_mid_spread_bps,
+                                        self.config.exit_rebalance_exit_spread_bps,
+                                        self.config.exit_rebalance_confirm_secs
+                                    );
+                                }
+
+                                if let Some(since) = exit_rebalance_below_threshold_since {
+                                    if since.elapsed()
+                                        >= Duration::from_secs(self.config.exit_rebalance_confirm_secs)
+                                    {
+                                        if Instant::now() >= next_exit_rebalance_allowed_at {
+                                            match self
+                                                .trigger_exit_rebalance(
+                                                    &maker_symbol,
+                                                    &hedge_symbol,
+                                                    pac_bid,
+                                                    pac_ask,
+                                                    hl_bid,
+                                                    hl_ask,
+                                                    abs_mid_spread_bps,
+                                                )
+                                                .await
+                                            {
+                                                Ok(triggered) => {
+                                                    if triggered {
+                                                        info!(
+                                                            "[EXIT] {} Exit/rebalance flatten submitted",
+                                                            "✓".green().bold()
+                                                        );
+                                                    } else {
+                                                        info!("[EXIT] No flattening needed at trigger");
+                                                    }
+                                                    exit_rebalance_armed = false;
+                                                    exit_rebalance_below_threshold_since = None;
+                                                    next_exit_rebalance_allowed_at = Instant::now()
+                                                        + Duration::from_secs(
+                                                            self.config
+                                                                .exit_rebalance_cooldown_secs
+                                                                .max(1),
+                                                        );
+                                                    next_order_attempt_allowed_at = Instant::now()
+                                                        + Duration::from_secs(2);
+                                                }
+                                                Err(e) => {
+                                                    info!(
+                                                        "[EXIT] {} Exit/rebalance failed: {}",
+                                                        "✗".red().bold(),
+                                                        e
+                                                    );
+                                                    exit_rebalance_below_threshold_since = None;
+                                                    next_exit_rebalance_allowed_at = Instant::now()
+                                                        + Duration::from_secs(
+                                                            self.config
+                                                                .exit_rebalance_cooldown_secs
+                                                                .max(1),
+                                                        );
+                                                }
+                                            }
+                                        }
+                                        // Don't place new maker orders while waiting/handling exit trigger.
+                                        continue;
+                                    }
+                                }
+
+                                // Armed and below exit threshold; suppress new entries until confirmed.
+                                continue;
+                            } else {
+                                exit_rebalance_below_threshold_since = None;
+                            }
+                        }
                     }
 
                     // Get timestamp once for this evaluation cycle
@@ -635,7 +954,6 @@ impl XemmBot {
                     let buy_opp = self.evaluator.evaluate_buy_opportunity(hl_bid, self.config.order_notional_usd, now_ms);
                     let sell_opp = self.evaluator.evaluate_sell_opportunity(hl_ask, self.config.order_notional_usd, now_ms);
 
-                    let pac_mid = (pac_bid + pac_ask) / 2.0;
                     let best_opp = OpportunityEvaluator::pick_best_opportunity(buy_opp, sell_opp, pac_mid);
 
                     if let Some(opp) = best_opp {
@@ -744,15 +1062,16 @@ impl XemmBot {
                                         );
                                     }
 
+                                    let placed_at = Instant::now();
                                     let active_order = ActiveOrder {
-                                        client_order_id,
+                                        client_order_id: client_order_id.clone(),
                                         exchange_order_id: order_data.order_id.clone(),
                                         symbol: maker_symbol.clone(),
                                         side: opp.direction,
                                         price: maker_limit_price,
                                         size: opp.size,
                                         initial_profit_bps,
-                                        placed_at: Instant::now(),
+                                        placed_at,
                                     };
 
                                     state.set_active_order(active_order);
@@ -761,12 +1080,18 @@ impl XemmBot {
                                     sync_atomic_status(&self.atomic_status, &state.status);
                                     update_order_snapshot(
                                         &self.order_snapshot,
+                                        client_order_id.clone(),
                                         opp.direction,
                                         maker_limit_price,
                                         opp.size,
                                         initial_profit_bps,
+                                        placed_at,
                                     );
                                 } else {
+                                    if self.config.order_failure_cooldown_ms > 0 {
+                                        next_order_attempt_allowed_at = Instant::now()
+                                            + Duration::from_millis(self.config.order_failure_cooldown_ms);
+                                    }
                                     info!("{} {} Order placed but no id returned",
                                         format!("[{} ORDER]", symbol_pair).bright_yellow().bold(),
                                         "✗".red().bold()
@@ -777,6 +1102,11 @@ impl XemmBot {
                                 if is_rate_limit_error(&e) {
                                     order_placement_rate_limit.record_error();
                                     let backoff_secs = order_placement_rate_limit.get_backoff_secs();
+                                    let cooldown_target = Instant::now()
+                                        + Duration::from_secs(backoff_secs.max(1));
+                                    if cooldown_target > next_order_attempt_allowed_at {
+                                        next_order_attempt_allowed_at = cooldown_target;
+                                    }
                                     info!(
                                         "{} {} Failed to place order: Rate limit exceeded. Backing off for {}s (attempt #{})",
                                         format!("[{} ORDER]", symbol_pair).bright_yellow().bold(),
@@ -785,10 +1115,26 @@ impl XemmBot {
                                         order_placement_rate_limit.consecutive_errors()
                                     );
                                 } else {
+                                    let is_post_only_reject = is_post_only_reject_error(&e);
+                                    let cooldown_ms = if is_post_only_reject {
+                                        self.config.post_only_reject_cooldown_ms
+                                    } else {
+                                        self.config.order_failure_cooldown_ms
+                                    };
+                                    if cooldown_ms > 0 {
+                                        next_order_attempt_allowed_at = Instant::now()
+                                            + Duration::from_millis(cooldown_ms);
+                                    }
                                     info!("{} {} Failed to place order: {}",
                                         format!("[{} ORDER]", symbol_pair).bright_yellow().bold(),
                                         "✗".red().bold(),
                                         e.to_string().red()
+                                    );
+                                    info!(
+                                        "{} Cooldown after failure: {} ms ({})",
+                                        format!("[{} ORDER]", symbol_pair).bright_yellow().bold(),
+                                        cooldown_ms,
+                                        if is_post_only_reject { "post_only_reject" } else { "generic_failure" }
                                     );
                                 }
                             }

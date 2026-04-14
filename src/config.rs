@@ -62,6 +62,45 @@ pub struct Config {
     #[serde(default = "default_order_refresh_interval")]
     pub order_refresh_interval_secs: u64,
 
+    /// Main opportunity loop interval in milliseconds.
+    /// Larger values reduce API pressure and order trigger frequency.
+    #[serde(default = "default_evaluation_loop_interval_ms")]
+    pub evaluation_loop_interval_ms: u64,
+
+    /// Generic cooldown after order placement failure (ms).
+    #[serde(default = "default_order_failure_cooldown_ms")]
+    pub order_failure_cooldown_ms: u64,
+
+    /// Cooldown after Binance post-only reject (-5022) (ms).
+    #[serde(default = "default_post_only_reject_cooldown_ms")]
+    pub post_only_reject_cooldown_ms: u64,
+
+    /// Enable event-mode exit/rebalance:
+    /// 1) arm when |mid spread| >= entry threshold
+    /// 2) flatten both exchanges when |mid spread| <= exit threshold for confirm duration
+    #[serde(default = "default_enable_exit_rebalance")]
+    pub enable_exit_rebalance: bool,
+
+    /// Arm threshold for event-mode exit/rebalance (absolute mid spread bps).
+    #[serde(default = "default_exit_rebalance_entry_spread_bps")]
+    pub exit_rebalance_entry_spread_bps: f64,
+
+    /// Exit trigger threshold for event-mode exit/rebalance (absolute mid spread bps).
+    #[serde(default = "default_exit_rebalance_exit_spread_bps")]
+    pub exit_rebalance_exit_spread_bps: f64,
+
+    /// Require spread to stay under exit threshold for this many seconds before flattening.
+    #[serde(default = "default_exit_rebalance_confirm_secs")]
+    pub exit_rebalance_confirm_secs: u64,
+
+    /// Cooldown between exit/rebalance attempts.
+    #[serde(default = "default_exit_rebalance_cooldown_secs")]
+    pub exit_rebalance_cooldown_secs: u64,
+
+    /// Minimum absolute position size to consider non-flat when flattening.
+    #[serde(default = "default_exit_rebalance_min_abs_position")]
+    pub exit_rebalance_min_abs_position: f64,
+
     /// Hyperliquid slippage tolerance for market orders (e.g., 0.05 = 5%)
     #[serde(default = "default_hyperliquid_slippage")]
     pub hyperliquid_slippage: f64,
@@ -126,6 +165,42 @@ fn default_order_refresh_interval() -> u64 {
     60 // 60 seconds
 }
 
+fn default_evaluation_loop_interval_ms() -> u64 {
+    50 // 50ms (safer than 1ms for rate limits)
+}
+
+fn default_order_failure_cooldown_ms() -> u64 {
+    1500 // 1.5s
+}
+
+fn default_post_only_reject_cooldown_ms() -> u64 {
+    6000 // 6s
+}
+
+fn default_enable_exit_rebalance() -> bool {
+    false
+}
+
+fn default_exit_rebalance_entry_spread_bps() -> f64 {
+    100.0
+}
+
+fn default_exit_rebalance_exit_spread_bps() -> f64 {
+    40.0
+}
+
+fn default_exit_rebalance_confirm_secs() -> u64 {
+    15
+}
+
+fn default_exit_rebalance_cooldown_secs() -> u64 {
+    120
+}
+
+fn default_exit_rebalance_min_abs_position() -> f64 {
+    0.01
+}
+
 fn default_hyperliquid_slippage() -> f64 {
     0.05 // 5%
 }
@@ -159,6 +234,15 @@ impl Default for Config {
             order_notional_usd: default_order_notional(),
             profit_cancel_threshold_bps: default_profit_cancel_threshold(),
             order_refresh_interval_secs: default_order_refresh_interval(),
+            evaluation_loop_interval_ms: default_evaluation_loop_interval_ms(),
+            order_failure_cooldown_ms: default_order_failure_cooldown_ms(),
+            post_only_reject_cooldown_ms: default_post_only_reject_cooldown_ms(),
+            enable_exit_rebalance: default_enable_exit_rebalance(),
+            exit_rebalance_entry_spread_bps: default_exit_rebalance_entry_spread_bps(),
+            exit_rebalance_exit_spread_bps: default_exit_rebalance_exit_spread_bps(),
+            exit_rebalance_confirm_secs: default_exit_rebalance_confirm_secs(),
+            exit_rebalance_cooldown_secs: default_exit_rebalance_cooldown_secs(),
+            exit_rebalance_min_abs_position: default_exit_rebalance_min_abs_position(),
             hyperliquid_slippage: default_hyperliquid_slippage(),
             hyperliquid_use_ws_for_hedge: default_hyperliquid_use_ws_for_hedge(),
             pacifica_rest_poll_interval_secs: default_pacifica_rest_poll_interval(),
@@ -246,6 +330,43 @@ impl Config {
         anyhow::ensure!(
             self.reconnect_attempts > 0,
             "Reconnect attempts must be greater than 0"
+        );
+
+        anyhow::ensure!(
+            self.evaluation_loop_interval_ms >= 1 && self.evaluation_loop_interval_ms <= 5000,
+            "evaluation_loop_interval_ms must be between 1 and 5000 ms"
+        );
+        anyhow::ensure!(
+            self.order_failure_cooldown_ms <= 120_000,
+            "order_failure_cooldown_ms must be <= 120000 ms"
+        );
+        anyhow::ensure!(
+            self.post_only_reject_cooldown_ms <= 120_000,
+            "post_only_reject_cooldown_ms must be <= 120000 ms"
+        );
+        anyhow::ensure!(
+            self.exit_rebalance_entry_spread_bps > 0.0,
+            "exit_rebalance_entry_spread_bps must be > 0"
+        );
+        anyhow::ensure!(
+            self.exit_rebalance_exit_spread_bps > 0.0,
+            "exit_rebalance_exit_spread_bps must be > 0"
+        );
+        anyhow::ensure!(
+            self.exit_rebalance_entry_spread_bps > self.exit_rebalance_exit_spread_bps,
+            "exit_rebalance_entry_spread_bps must be greater than exit_rebalance_exit_spread_bps"
+        );
+        anyhow::ensure!(
+            self.exit_rebalance_confirm_secs <= 600,
+            "exit_rebalance_confirm_secs must be <= 600"
+        );
+        anyhow::ensure!(
+            self.exit_rebalance_cooldown_secs <= 3600,
+            "exit_rebalance_cooldown_secs must be <= 3600"
+        );
+        anyhow::ensure!(
+            self.exit_rebalance_min_abs_position >= 0.0 && self.exit_rebalance_min_abs_position <= 1000.0,
+            "exit_rebalance_min_abs_position must be between 0 and 1000"
         );
 
         Ok(())
