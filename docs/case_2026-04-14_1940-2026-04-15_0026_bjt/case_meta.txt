@@ -1,0 +1,5 @@
+start_utc=2026-04-14T11:40:39
+end_utc=2026-04-14T16:26:14
+start_bjt=2026-04-14_1940
+end_bjt=2026-04-15_0026
+source_log=logs/xemm_test_20260414_204039.log
