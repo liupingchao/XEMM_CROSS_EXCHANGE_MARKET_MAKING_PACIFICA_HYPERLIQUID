@@ -11,7 +11,8 @@ use crate::config::Config;
 use crate::connector::hyperliquid::HyperliquidTrading;
 use crate::connector::maker::MakerExchange;
 use crate::strategy::{OpportunityEvaluator, OrderSide};
-use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
+use crate::util::api_health::BinanceApiHealth;
+use crate::util::rate_limit::{is_rate_limit_error, parse_ban_until_ms, RateLimitTracker};
 
 // ============================================================================
 // ATOMIC STATUS FOR LOCK-FREE HOT PATH CHECKS
@@ -149,6 +150,9 @@ pub struct OrderMonitorService {
     
     // Channel for cancel requests (decouples hot path from I/O)
     pub cancel_tx: mpsc::Sender<CancelRequest>,
+
+    // Shared API health state
+    pub api_health: Arc<BinanceApiHealth>,
 }
 
 impl OrderMonitorService {
@@ -165,10 +169,11 @@ impl OrderMonitorService {
         evaluator: OpportunityEvaluator,
         maker_exchange: Arc<dyn MakerExchange>,
         hyperliquid_trading: Arc<HyperliquidTrading>,
+        api_health: Arc<BinanceApiHealth>,
     ) -> (Self, mpsc::Receiver<CancelRequest>) {
         // Bounded channel to prevent unbounded growth, but large enough to not block
         let (cancel_tx, cancel_rx) = mpsc::channel(64);
-        
+
         let service = Self {
             bot_state,
             atomic_status,
@@ -182,8 +187,9 @@ impl OrderMonitorService {
             maker_exchange,
             hyperliquid_trading,
             cancel_tx,
+            api_health,
         };
-        
+
         (service, cancel_rx)
     }
 
@@ -320,6 +326,13 @@ impl OrderMonitorService {
         let mut rate_limit = RateLimitTracker::new();
 
         while let Some(request) = cancel_rx.recv().await {
+            // Skip all API calls if Binance IP is banned
+            if self.api_health.should_skip_api_call() {
+                debug!("[CANCEL] Skipping - Binance API banned");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
             // Check rate limit backoff
             if rate_limit.should_skip() {
                 debug!(
@@ -387,8 +400,11 @@ impl OrderMonitorService {
                     // Safe to proceed with cancellation
                 }
                 FillCheckResult::CheckFailed(e) => {
-                    debug!("[CANCEL] Fill check failed: {} - proceeding with cancellation", e);
-                    // Continue with cancellation (safer than leaving hanging orders)
+                    warn!("[CANCEL] Fill check failed: {} - deferring cancellation (API may be down)", e);
+                    if let Some(until_ms) = parse_ban_until_ms(&anyhow::anyhow!("{}", e)) {
+                        self.api_health.mark_banned(until_ms);
+                    }
+                    continue;
                 }
             }
 
@@ -448,11 +464,19 @@ impl OrderMonitorService {
                 Err(e) => {
                     if is_rate_limit_error(&e) {
                         rate_limit.record_error();
-                        warn!(
-                            "[CANCEL] Rate limit exceeded. Backing off for {}s (attempt #{})",
-                            rate_limit.get_backoff_secs(),
-                            rate_limit.consecutive_errors()
-                        );
+                        if let Some(until_ms) = parse_ban_until_ms(&e) {
+                            self.api_health.mark_banned(until_ms);
+                            warn!(
+                                "[CANCEL] IP banned until {} - pausing all Binance API calls",
+                                until_ms
+                            );
+                        } else {
+                            warn!(
+                                "[CANCEL] Rate limit exceeded. Backing off for {}s (attempt #{})",
+                                rate_limit.get_backoff_secs(),
+                                rate_limit.consecutive_errors()
+                            );
+                        }
                     } else {
                         warn!("[CANCEL] Failed to cancel: {}", e);
                     }

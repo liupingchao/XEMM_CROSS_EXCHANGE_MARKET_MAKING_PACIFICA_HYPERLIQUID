@@ -73,10 +73,24 @@ impl Default for RateLimitTracker {
     }
 }
 
-/// Check if an error is a rate limit error
+/// Check if an error is a rate limit error (including Binance 403/418 IP bans)
 pub fn is_rate_limit_error(error: &anyhow::Error) -> bool {
     let error_string = error.to_string().to_lowercase();
     error_string.contains("rate limit")
         || error_string.contains("too many requests")
         || error_string.contains("429")
+        || error_string.contains("403 forbidden")
+        || error_string.contains("418")
+        || error_string.contains("-1003")
+}
+
+/// Parse ban expiry timestamp from Binance 418 error message.
+/// Returns epoch milliseconds if found.
+/// Example: "banned until 1776172019921" → Some(1776172019921)
+pub fn parse_ban_until_ms(error: &anyhow::Error) -> Option<u64> {
+    let s = error.to_string();
+    let idx = s.find("banned until ")?;
+    let after = &s[idx + 13..];
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u64>().ok().filter(|&v| v > 0)
 }

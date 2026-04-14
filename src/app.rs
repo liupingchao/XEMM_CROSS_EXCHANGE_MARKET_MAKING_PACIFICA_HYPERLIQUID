@@ -33,7 +33,8 @@ use crate::services::{
     HedgeEvent,
 };
 use crate::strategy::{EntryProfile, OpportunityEvaluator, OrderSide, RegimeController, RegimeSettings};
-use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
+use crate::util::api_health::BinanceApiHealth;
+use crate::util::rate_limit::{is_rate_limit_error, parse_ban_until_ms, RateLimitTracker};
 
 fn is_post_only_reject_error(error: &anyhow::Error) -> bool {
     let s = error.to_string().to_ascii_lowercase();
@@ -103,6 +104,9 @@ pub struct XemmBot {
 
     // Hyperliquid wallet address (validated at startup)
     pub hl_wallet: String,
+
+    // Shared Binance API health state
+    pub api_health: Arc<BinanceApiHealth>,
 }
 
 impl XemmBot {
@@ -391,6 +395,7 @@ impl XemmBot {
 
         // Initialize order monitor state
         let atomic_status = Arc::new(AtomicU8::new(AtomicBotStatus::Idle as u8));
+        let api_health = Arc::new(BinanceApiHealth::new());
         let order_snapshot = Arc::new(SharedOrderSnapshot::new());
 
         Ok(XemmBot {
@@ -417,6 +422,7 @@ impl XemmBot {
             shutdown_tx,
             shutdown_rx: Some(shutdown_rx),
             pacifica_credentials,
+            api_health,
         })
     }
 
@@ -669,6 +675,7 @@ impl XemmBot {
                 reconnect_attempts: self.config.reconnect_attempts,
                 ping_interval_secs: self.config.ping_interval_secs,
                 min_hedge_notional: 10.0,
+                api_health: self.api_health.clone(),
             };
             tokio::spawn(async move {
                 binance_fill_service.run().await;
@@ -729,6 +736,7 @@ impl XemmBot {
             processed_fills: self.processed_fills.clone(),
             min_hedge_notional: 10.0,
             poll_interval_ms: self.config.pacifica_active_order_rest_poll_interval_ms,
+            api_health: self.api_health.clone(),
         };
         tokio::spawn(async move {
             rest_fill_service.run().await;
@@ -769,6 +777,7 @@ impl XemmBot {
             self.normal_evaluator.clone(),
             self.maker_exchange.clone(),
             self.hyperliquid_trading.clone(),
+            self.api_health.clone(),
         );
         let order_monitor_service = Arc::new(order_monitor_service);
         spawn_monitor_tasks(order_monitor_service, cancel_rx);
@@ -804,6 +813,7 @@ impl XemmBot {
         ));
         let mut order_placement_rate_limit = RateLimitTracker::new();
         let mut next_order_attempt_allowed_at = Instant::now();
+        let mut last_health_warn = Instant::now() - Duration::from_secs(60);
         let mut exit_rebalance_below_threshold_since: Option<Instant> = None;
         let mut next_exit_rebalance_allowed_at = Instant::now();
         let mut last_event_active = false;
@@ -867,6 +877,15 @@ impl XemmBot {
                         continue;
                     }
                     drop(state);
+
+                    // Block order placement if fill detection is blind
+                    if matches!(self.maker_kind, MakerExchangeKind::Binance) && !self.api_health.is_healthy() {
+                        if last_health_warn.elapsed() > Duration::from_secs(30) {
+                            warn!("[MAIN] Fill detection channels degraded (stream down + REST rate-limited) - pausing order placement");
+                            last_health_warn = Instant::now();
+                        }
+                        continue;
+                    }
 
                     // Check rate limit backoff
                     if order_placement_rate_limit.should_skip() {
@@ -1201,6 +1220,15 @@ impl XemmBot {
                             Err(e) => {
                                 if is_rate_limit_error(&e) {
                                     order_placement_rate_limit.record_error();
+                                    if let Some(until_ms) = parse_ban_until_ms(&e) {
+                                        self.api_health.mark_banned(until_ms);
+                                        warn!(
+                                            "{} {} IP banned until {} - pausing all Binance API calls",
+                                            format!("[{} ORDER]", symbol_pair).bright_yellow().bold(),
+                                            "⚠".yellow().bold(),
+                                            until_ms
+                                        );
+                                    }
                                     let backoff_secs = order_placement_rate_limit.get_backoff_secs();
                                     let cooldown_target = Instant::now()
                                         + Duration::from_secs(backoff_secs.max(1));

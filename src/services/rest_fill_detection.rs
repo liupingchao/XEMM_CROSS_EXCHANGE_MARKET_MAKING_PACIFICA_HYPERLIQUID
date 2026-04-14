@@ -12,7 +12,8 @@ use crate::bot::{ActiveOrder, BotState, PendingOrder};
 use crate::connector::maker::MakerExchange;
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
-use crate::util::rate_limit::is_rate_limit_error;
+use crate::util::api_health::BinanceApiHealth;
+use crate::util::rate_limit::{is_rate_limit_error, parse_ban_until_ms};
 
 /// REST API fill detection service (backup/fallback method)
 ///
@@ -26,6 +27,7 @@ pub struct RestFillDetectionService {
     pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
     pub min_hedge_notional: f64,
     pub poll_interval_ms: u64,
+    pub api_health: Arc<BinanceApiHealth>,
 }
 
 impl RestFillDetectionService {
@@ -322,6 +324,7 @@ impl RestFillDetectionService {
             match open_orders_result {
                 Ok(orders) => {
                     consecutive_errors = 0;
+                    self.api_health.mark_rest_available(true);
 
                     for tracked in tracked_orders {
                         let tracked_order = tracked.order.clone();
@@ -476,6 +479,16 @@ impl RestFillDetectionService {
                     let is_rate_limit = is_rate_limit_error(&e);
 
                     if is_rate_limit {
+                        self.api_health.mark_rest_available(false);
+                        if let Some(until_ms) = parse_ban_until_ms(&e) {
+                            self.api_health.mark_banned(until_ms);
+                            warn!(
+                                "{} {} IP banned until {} - pausing REST polling",
+                                "[REST_FILL_DETECTION]".bright_cyan().bold(),
+                                "⚠".yellow().bold(),
+                                until_ms
+                            );
+                        }
                         let backoff_secs = std::cmp::min(2u64.pow(consecutive_errors - 1), 32);
                         warn!(
                             "{} {} Rate limit hit, backing off for {} seconds...",
@@ -490,6 +503,7 @@ impl RestFillDetectionService {
                             consecutive_errors, e
                         );
                         if consecutive_errors >= 5 {
+                            self.api_health.mark_rest_available(false);
                             warn!(
                                 "{} {} {} consecutive errors fetching open orders",
                                 "[REST_FILL_DETECTION]".bright_cyan().bold(),

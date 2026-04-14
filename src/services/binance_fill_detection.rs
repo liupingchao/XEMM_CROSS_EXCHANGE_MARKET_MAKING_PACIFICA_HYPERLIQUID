@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::Result;
 use colored::Colorize;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
@@ -14,6 +15,7 @@ use crate::connector::binance::{
 use crate::connector::maker::{MakerExchange, MakerOrderSide};
 use crate::services::HedgeEvent;
 use crate::strategy::OrderSide;
+use crate::util::api_health::BinanceApiHealth;
 
 pub struct BinanceFillDetectionService {
     pub bot_state: Arc<RwLock<BotState>>,
@@ -24,40 +26,55 @@ pub struct BinanceFillDetectionService {
     pub reconnect_attempts: u32,
     pub ping_interval_secs: u64,
     pub min_hedge_notional: f64,
+    pub api_health: Arc<BinanceApiHealth>,
 }
 
 impl BinanceFillDetectionService {
     pub async fn run(self) {
-        let creds = match BinanceCredentials::from_env() {
-            Ok(v) => v,
-            Err(e) => {
-                error!(
-                    "{} {} Failed to load Binance credentials: {}",
-                    "[BINANCE_FILL]".bright_magenta().bold(),
-                    "✗".red().bold(),
-                    e
-                );
-                return;
+        loop {
+            // Wait for API to become available if currently banned
+            while self.api_health.is_banned() {
+                self.api_health.mark_stream_alive(false);
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             }
-        };
+
+            self.api_health.mark_stream_alive(true);
+
+            match self.run_stream_once().await {
+                Ok(()) => break, // Graceful exit
+                Err(e) => {
+                    self.api_health.mark_stream_alive(false);
+                    warn!(
+                        "{} {} User stream failed: {} — retrying in 60s",
+                        "[BINANCE_FILL]".bright_magenta().bold(),
+                        "⚠".yellow().bold(),
+                        e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+            }
+        }
+    }
+
+    async fn run_stream_once(&self) -> Result<()> {
+        let creds = BinanceCredentials::from_env()
+            .map_err(|e| {
+                error!("{} {} Failed to load Binance credentials: {}",
+                    "[BINANCE_FILL]".bright_magenta().bold(), "✗".red().bold(), e);
+                e
+            })?;
 
         let stream_config = BinanceUserStreamConfig {
             reconnect_attempts: self.reconnect_attempts,
             ping_interval_secs: self.ping_interval_secs,
             listen_key_keepalive_secs: 30 * 60,
         };
-        let stream_client = match BinanceUserStreamClient::new(creds, false, stream_config) {
-            Ok(v) => v,
-            Err(e) => {
-                error!(
-                    "{} {} Failed to create Binance user stream client: {}",
-                    "[BINANCE_FILL]".bright_magenta().bold(),
-                    "✗".red().bold(),
-                    e
-                );
-                return;
-            }
-        };
+        let stream_client = BinanceUserStreamClient::new(creds, false, stream_config)
+            .map_err(|e| {
+                error!("{} {} Failed to create Binance user stream client: {}",
+                    "[BINANCE_FILL]".bright_magenta().bold(), "✗".red().bold(), e);
+                e
+            })?;
 
         let bot_state = self.bot_state.clone();
         let hedge_tx = self.hedge_tx.clone();
@@ -271,14 +288,15 @@ impl BinanceFillDetectionService {
             })
             .await;
 
-        if let Err(e) = run_result {
+        run_result.map_err(|e| {
             error!(
                 "{} {} User stream stopped: {}",
                 "[BINANCE_FILL]".bright_magenta().bold(),
                 "✗".red().bold(),
                 e
             );
-        }
+            e
+        })
     }
 }
 
