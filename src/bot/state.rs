@@ -207,6 +207,15 @@ impl BotState {
         self.pending_orders.clear();
     }
 
+    /// Mark current cycle complete and return to Idle for continuous mode.
+    pub fn mark_cycle_complete_continue(&mut self) {
+        self.active_order = None;
+        self.pending_orders.clear();
+        self.status = BotStatus::Idle;
+        self.status_atomic.store(0, Ordering::Release); // 0 = Idle
+        self.last_cancellation_time = None;
+    }
+
     /// Set error status
     pub fn set_error(&mut self, error: String) {
         self.status = BotStatus::Error(error);

@@ -12,7 +12,7 @@ use tracing::{debug, info};
 
 use crate::audit_logger;
 use crate::bot::{ActiveOrder, BotState, BotStatus};
-use crate::config::Config;
+use crate::config::{Config, ModeTradingConfig};
 use crate::connector::binance::{BinanceCredentials, BinanceTrading};
 use crate::connector::hyperliquid::{HyperliquidCredentials, HyperliquidTrading};
 use crate::connector::maker::{
@@ -32,7 +32,7 @@ use crate::services::{
     spread_recorder::SpreadRecorderService,
     HedgeEvent,
 };
-use crate::strategy::{OpportunityEvaluator, OrderSide};
+use crate::strategy::{EntryProfile, OpportunityEvaluator, OrderSide, RegimeController, RegimeSettings};
 use crate::util::rate_limit::{is_rate_limit_error, RateLimitTracker};
 
 fn is_post_only_reject_error(error: &anyhow::Error) -> bool {
@@ -79,7 +79,10 @@ pub struct XemmBot {
     pub hyperliquid_prices: Arc<Mutex<(f64, f64)>>, // (bid, ask)
 
     // Opportunity evaluator
-    pub evaluator: OpportunityEvaluator,
+    pub normal_evaluator: OpportunityEvaluator,
+    pub event_evaluator: OpportunityEvaluator,
+    pub normal_mode: ModeTradingConfig,
+    pub event_mode: ModeTradingConfig,
 
     // Fill tracking state
     pub processed_fills: Arc<parking_lot::Mutex<HashSet<String>>>,
@@ -133,15 +136,17 @@ impl XemmBot {
         config.validate().context("Invalid configuration")?;
         let maker_symbol = config.maker_symbol_str().to_string();
         let hedge_symbol = config.hedge_symbol_str().to_string();
+        let normal_mode = config.normal_mode_config();
+        let event_mode = config.event_mode_config();
 
         info!("{} Symbol Pair: {} -> {}",
             "[CONFIG]".blue().bold(),
             maker_symbol.bright_white().bold(),
             hedge_symbol.bright_white().bold()
         );
-        info!("{} Order Notional: {}",
+        info!("{} Strategy Mode: {:?}",
             "[CONFIG]".blue().bold(),
-            format!("${:.2}", config.order_notional_usd).bright_white()
+            config.strategy_mode
         );
         info!("{} Pacifica Maker Fee: {}",
             "[CONFIG]".blue().bold(),
@@ -151,17 +156,34 @@ impl XemmBot {
             "[CONFIG]".blue().bold(),
             format!("{} bps", config.hyperliquid_taker_fee_bps).bright_white()
         );
-        info!("{} Target Profit: {}",
+        info!("{} Normal Profile: notional=${:.2}, profit={:.2}bps, cancel={:.2}bps, refresh={}s",
             "[CONFIG]".blue().bold(),
-            format!("{} bps", config.profit_rate_bps).green().bold()
+            normal_mode.order_notional_usd,
+            normal_mode.profit_rate_bps,
+            normal_mode.profit_cancel_threshold_bps,
+            normal_mode.order_refresh_interval_secs
         );
-        info!("{} Profit Cancel Threshold: {}",
+        info!("{} Event Profile: notional=${:.2}, profit={:.2}bps, cancel={:.2}bps, refresh={}s",
             "[CONFIG]".blue().bold(),
-            format!("{} bps", config.profit_cancel_threshold_bps).yellow()
+            event_mode.order_notional_usd,
+            event_mode.profit_rate_bps,
+            event_mode.profit_cancel_threshold_bps,
+            event_mode.order_refresh_interval_secs
         );
-        info!("{} Order Refresh Interval: {}",
+        info!("{} Event Trigger: |mid|>={:.2}bps, hl_spread>={:.2}bps, confirm={}s, rearm={}s",
             "[CONFIG]".blue().bold(),
-            format!("{} secs", config.order_refresh_interval_secs).bright_white()
+            config.event_trigger_mid_spread_bps,
+            config.event_trigger_hl_spread_bps,
+            config.event_trigger_confirm_secs,
+            config.event_rearm_cooldown_secs
+        );
+        info!("{} Continuous Mode: {}",
+            "[CONFIG]".blue().bold(),
+            if config.continuous_mode {
+                "enabled".green().bold().to_string()
+            } else {
+                "disabled".yellow().bold().to_string()
+            }
         );
         info!("{} Evaluation Loop Interval: {}",
             "[CONFIG]".blue().bold(),
@@ -321,11 +343,17 @@ impl XemmBot {
             format!("{}", maker_tick_size).bright_white()
         );
 
-        // Create opportunity evaluator
-        let evaluator = OpportunityEvaluator::new(
+        // Create opportunity evaluators for dual-mode profiles
+        let normal_evaluator = OpportunityEvaluator::new(
             config.pacifica_maker_fee_bps,
             config.hyperliquid_taker_fee_bps,
-            config.profit_rate_bps,
+            normal_mode.profit_rate_bps,
+            maker_tick_size,
+        );
+        let event_evaluator = OpportunityEvaluator::new(
+            config.pacifica_maker_fee_bps,
+            config.hyperliquid_taker_fee_bps,
+            event_mode.profit_rate_bps,
             maker_tick_size,
         );
 
@@ -371,7 +399,10 @@ impl XemmBot {
             hyperliquid_trading,
             pacifica_prices,
             hyperliquid_prices,
-            evaluator,
+            normal_evaluator,
+            event_evaluator,
+            normal_mode,
+            event_mode,
             processed_fills,
             last_position_snapshot,
             atomic_status,
@@ -730,7 +761,7 @@ impl XemmBot {
             self.config.clone(),
             maker_symbol.clone(),
             hedge_symbol.clone(),
-            self.evaluator.clone(),
+            self.normal_evaluator.clone(),
             self.maker_exchange.clone(),
             self.hyperliquid_trading.clone(),
         );
@@ -767,9 +798,15 @@ impl XemmBot {
         ));
         let mut order_placement_rate_limit = RateLimitTracker::new();
         let mut next_order_attempt_allowed_at = Instant::now();
-        let mut exit_rebalance_armed = false;
         let mut exit_rebalance_below_threshold_since: Option<Instant> = None;
         let mut next_exit_rebalance_allowed_at = Instant::now();
+        let mut last_event_active = false;
+        let mut regime = RegimeController::new(RegimeSettings {
+            strategy_mode: self.config.strategy_mode,
+            event_trigger_mid_spread_bps: self.config.event_trigger_mid_spread_bps,
+            event_trigger_hl_spread_bps: self.config.event_trigger_hl_spread_bps,
+            event_trigger_confirm_secs: self.config.event_trigger_confirm_secs,
+        });
 
         let sigint = signal::ctrl_c();
         tokio::pin!(sigint);
@@ -851,97 +888,134 @@ impl XemmBot {
                     if hl_mid <= 0.0 {
                         continue;
                     }
-                    let abs_mid_spread_bps = (((pac_mid - hl_mid) / hl_mid) * 10000.0).abs();
+                    let mid_spread_bps = ((pac_mid - hl_mid) / hl_mid) * 10000.0;
+                    let abs_mid_spread_bps = mid_spread_bps.abs();
+                    let hl_spread_bps = ((hl_ask - hl_bid) / hl_mid) * 10000.0;
+                    let regime_decision =
+                        regime.update(Instant::now(), mid_spread_bps, hl_spread_bps.max(0.0));
+                    if regime_decision.event_active && !last_event_active {
+                        info!(
+                            "[REGIME] {} Event mode activated | mid={:+.2}bps hl_spread={:.2}bps direction={}",
+                            "⚡".yellow().bold(),
+                            mid_spread_bps,
+                            hl_spread_bps.max(0.0),
+                            regime_decision
+                                .direction_filter
+                                .map(|s| s.as_str())
+                                .unwrap_or("-")
+                        );
+                    } else if !regime_decision.event_active && last_event_active {
+                        info!(
+                            "[REGIME] {} Back to normal mode",
+                            "✓".green().bold()
+                        );
+                    }
+                    last_event_active = regime_decision.event_active;
 
-                    if self.config.enable_exit_rebalance {
-                        if !exit_rebalance_armed
-                            && abs_mid_spread_bps >= self.config.exit_rebalance_entry_spread_bps
-                        {
-                            exit_rebalance_armed = true;
-                            exit_rebalance_below_threshold_since = None;
-                            info!(
-                                "[EXIT] Armed at {:.2} bps (threshold {:.2} bps)",
-                                abs_mid_spread_bps,
-                                self.config.exit_rebalance_entry_spread_bps
-                            );
-                        }
+                    if self.config.enable_exit_rebalance && regime_decision.event_active {
+                        if abs_mid_spread_bps <= self.config.exit_rebalance_exit_spread_bps {
+                            if exit_rebalance_below_threshold_since.is_none() {
+                                exit_rebalance_below_threshold_since = Some(Instant::now());
+                                info!(
+                                    "[EXIT] Spread back to {:.2} bps (<= {:.2}), waiting {}s confirmation",
+                                    abs_mid_spread_bps,
+                                    self.config.exit_rebalance_exit_spread_bps,
+                                    self.config.exit_rebalance_confirm_secs
+                                );
+                            }
 
-                        if exit_rebalance_armed {
-                            if abs_mid_spread_bps <= self.config.exit_rebalance_exit_spread_bps {
-                                if exit_rebalance_below_threshold_since.is_none() {
-                                    exit_rebalance_below_threshold_since = Some(Instant::now());
-                                    info!(
-                                        "[EXIT] Spread back to {:.2} bps (<= {:.2}), waiting {}s confirmation",
-                                        abs_mid_spread_bps,
-                                        self.config.exit_rebalance_exit_spread_bps,
-                                        self.config.exit_rebalance_confirm_secs
-                                    );
-                                }
-
-                                if let Some(since) = exit_rebalance_below_threshold_since {
-                                    if since.elapsed()
-                                        >= Duration::from_secs(self.config.exit_rebalance_confirm_secs)
-                                    {
-                                        if Instant::now() >= next_exit_rebalance_allowed_at {
-                                            match self
-                                                .trigger_exit_rebalance(
-                                                    &maker_symbol,
-                                                    &hedge_symbol,
-                                                    pac_bid,
-                                                    pac_ask,
-                                                    hl_bid,
-                                                    hl_ask,
-                                                    abs_mid_spread_bps,
-                                                )
-                                                .await
-                                            {
-                                                Ok(triggered) => {
-                                                    if triggered {
-                                                        info!(
-                                                            "[EXIT] {} Exit/rebalance flatten submitted",
-                                                            "✓".green().bold()
-                                                        );
-                                                    } else {
-                                                        info!("[EXIT] No flattening needed at trigger");
-                                                    }
-                                                    exit_rebalance_armed = false;
-                                                    exit_rebalance_below_threshold_since = None;
-                                                    next_exit_rebalance_allowed_at = Instant::now()
-                                                        + Duration::from_secs(
-                                                            self.config
-                                                                .exit_rebalance_cooldown_secs
-                                                                .max(1),
-                                                        );
-                                                    next_order_attempt_allowed_at = Instant::now()
-                                                        + Duration::from_secs(2);
-                                                }
-                                                Err(e) => {
+                            if let Some(since) = exit_rebalance_below_threshold_since {
+                                if since.elapsed()
+                                    >= Duration::from_secs(self.config.exit_rebalance_confirm_secs)
+                                {
+                                    if Instant::now() >= next_exit_rebalance_allowed_at {
+                                        match self
+                                            .trigger_exit_rebalance(
+                                                &maker_symbol,
+                                                &hedge_symbol,
+                                                pac_bid,
+                                                pac_ask,
+                                                hl_bid,
+                                                hl_ask,
+                                                abs_mid_spread_bps,
+                                            )
+                                            .await
+                                        {
+                                            Ok(triggered) => {
+                                                if triggered {
                                                     info!(
-                                                        "[EXIT] {} Exit/rebalance failed: {}",
-                                                        "✗".red().bold(),
-                                                        e
+                                                        "[EXIT] {} Event spread flattened and rebalanced",
+                                                        "✓".green().bold()
                                                     );
-                                                    exit_rebalance_below_threshold_since = None;
-                                                    next_exit_rebalance_allowed_at = Instant::now()
-                                                        + Duration::from_secs(
-                                                            self.config
-                                                                .exit_rebalance_cooldown_secs
-                                                                .max(1),
-                                                        );
+                                                } else {
+                                                    info!("[EXIT] Event ended without residual position");
                                                 }
+                                                regime.clear_event_with_cooldown(
+                                                    self.config.event_rearm_cooldown_secs,
+                                                );
+                                                exit_rebalance_below_threshold_since = None;
+                                                next_exit_rebalance_allowed_at = Instant::now()
+                                                    + Duration::from_secs(
+                                                        self.config
+                                                            .exit_rebalance_cooldown_secs
+                                                            .max(1),
+                                                    );
+                                                next_order_attempt_allowed_at =
+                                                    Instant::now() + Duration::from_secs(2);
+                                            }
+                                            Err(e) => {
+                                                info!(
+                                                    "[EXIT] {} Exit/rebalance failed: {}",
+                                                    "✗".red().bold(),
+                                                    e
+                                                );
+                                                exit_rebalance_below_threshold_since = None;
+                                                next_exit_rebalance_allowed_at = Instant::now()
+                                                    + Duration::from_secs(
+                                                        self.config
+                                                            .exit_rebalance_cooldown_secs
+                                                            .max(1),
+                                                    );
                                             }
                                         }
-                                        // Don't place new maker orders while waiting/handling exit trigger.
-                                        continue;
                                     }
+                                    // While event is reverting, suppress new entries.
+                                    continue;
                                 }
-
-                                // Armed and below exit threshold; suppress new entries until confirmed.
-                                continue;
-                            } else {
-                                exit_rebalance_below_threshold_since = None;
                             }
+                            continue;
+                        } else {
+                            exit_rebalance_below_threshold_since = None;
                         }
+                    } else {
+                        exit_rebalance_below_threshold_since = None;
+                    }
+
+                    if !self.config.enable_exit_rebalance && regime_decision.event_active {
+                        if abs_mid_spread_bps <= self.config.exit_rebalance_exit_spread_bps {
+                            if exit_rebalance_below_threshold_since.is_none() {
+                                exit_rebalance_below_threshold_since = Some(Instant::now());
+                            }
+                            if let Some(since) = exit_rebalance_below_threshold_since {
+                                if since.elapsed()
+                                    >= Duration::from_secs(self.config.exit_rebalance_confirm_secs)
+                                {
+                                    regime.clear_event_with_cooldown(
+                                        self.config.event_rearm_cooldown_secs,
+                                    );
+                                    exit_rebalance_below_threshold_since = None;
+                                    info!(
+                                        "[REGIME] Event mode released by spread normalization (flatten disabled)"
+                                    );
+                                }
+                            }
+                        } else {
+                            exit_rebalance_below_threshold_since = None;
+                        }
+                    }
+
+                    if regime_decision.suppress_entries {
+                        continue;
                     }
 
                     // Get timestamp once for this evaluation cycle
@@ -950,9 +1024,26 @@ impl XemmBot {
                         .unwrap()
                         .as_millis() as u64;
 
+                    let (active_profile, active_evaluator, profile_label) = match regime_decision.profile
+                    {
+                        EntryProfile::Normal => (&self.normal_mode, &self.normal_evaluator, "normal"),
+                        EntryProfile::Event => (&self.event_mode, &self.event_evaluator, "event"),
+                    };
+
                     // Evaluate opportunities
-                    let buy_opp = self.evaluator.evaluate_buy_opportunity(hl_bid, self.config.order_notional_usd, now_ms);
-                    let sell_opp = self.evaluator.evaluate_sell_opportunity(hl_ask, self.config.order_notional_usd, now_ms);
+                    let buy_opp = active_evaluator
+                        .evaluate_buy_opportunity(hl_bid, active_profile.order_notional_usd, now_ms);
+                    let sell_opp = active_evaluator
+                        .evaluate_sell_opportunity(hl_ask, active_profile.order_notional_usd, now_ms);
+
+                    let buy_opp = match regime_decision.direction_filter {
+                        Some(OrderSide::Buy) | None => buy_opp,
+                        Some(OrderSide::Sell) => None,
+                    };
+                    let sell_opp = match regime_decision.direction_filter {
+                        Some(OrderSide::Sell) | None => sell_opp,
+                        Some(OrderSide::Buy) => None,
+                    };
 
                     let best_opp = OpportunityEvaluator::pick_best_opportunity(buy_opp, sell_opp, pac_mid);
 
@@ -971,7 +1062,7 @@ impl XemmBot {
                             OrderSide::Buy => opp.pacifica_price.min(pac_bid),
                             OrderSide::Sell => opp.pacifica_price.max(pac_ask),
                         };
-                        let initial_profit_bps = self.evaluator.recalculate_profit_raw(
+                        let initial_profit_bps = active_evaluator.recalculate_profit_raw(
                             opp.direction,
                             maker_limit_price,
                             hl_bid,
@@ -979,8 +1070,9 @@ impl XemmBot {
                         );
 
                         info!(
-                            "{} {} @ {} (raw:{} ) → HL {} | Size: {} | Profit: {} | PAC: {}/{} | HL: {}/{}",
+                            "{} [{}] {} @ {} (raw:{} ) → HL {} | Size: {} | Profit: {} | PAC: {}/{} | HL: {}/{}",
                             format!("[{} OPPORTUNITY]", symbol_pair).bright_green().bold(),
+                            profile_label.to_uppercase().bright_white(),
                             opp.direction.as_str().bright_yellow().bold(),
                             format!("${:.6}", maker_limit_price).cyan().bold(),
                             format!("${:.6}", opp.pacifica_price).bright_black(),
@@ -1051,7 +1143,7 @@ impl XemmBot {
                                         maker_limit_price,
                                         order_data.order_id.clone(),
                                         Some(client_order_id.clone()),
-                                        "main_loop_limit_order".to_string(),
+                                        format!("main_loop_limit_order_{}", profile_label),
                                     );
                                     if let Err(e) = audit_logger::log_order(&order_csv, &order_record) {
                                         info!(
@@ -1086,6 +1178,8 @@ impl XemmBot {
                                         opp.size,
                                         initial_profit_bps,
                                         placed_at,
+                                        active_profile.profit_cancel_threshold_bps,
+                                        active_profile.order_refresh_interval_secs,
                                     );
                                 } else {
                                     if self.config.order_failure_cooldown_ms > 0 {
@@ -1176,9 +1270,9 @@ impl XemmBot {
         // Final state check
         let final_state = self.bot_state.read().await;
         match &final_state.status {
-            BotStatus::Complete => {
+            BotStatus::Complete | BotStatus::Idle | BotStatus::OrderPlaced | BotStatus::Filled | BotStatus::Hedging => {
                 info!("");
-                info!("{} {}", "✓".green().bold(), "Bot completed successfully!".green().bold());
+                info!("{} {}", "✓".green().bold(), "Bot terminated gracefully.".green().bold());
                 info!("Final position: {}", final_state.position);
                 Ok(())
             }
@@ -1186,11 +1280,6 @@ impl XemmBot {
                 info!("");
                 info!("{} {}: {}", "✗".red().bold(), "Bot terminated with error".red().bold(), e.to_string().red());
                 anyhow::bail!("Bot failed: {}", e)
-            }
-            _ => {
-                info!("");
-                info!("{} Bot terminated in unexpected state: {:?}", "⚠".yellow().bold(), final_state.status);
-                Ok(())
             }
         }
     }

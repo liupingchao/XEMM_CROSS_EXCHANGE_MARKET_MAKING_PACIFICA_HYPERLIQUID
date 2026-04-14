@@ -3,6 +3,52 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyMode {
+    Normal,
+    EventOnly,
+    Dual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModeTradingConfig {
+    /// Target profit rate in basis points (e.g., 10.0 = 0.1%)
+    pub profit_rate_bps: f64,
+    /// Order notional size in USD
+    pub order_notional_usd: f64,
+    /// Profit cancel threshold in basis points
+    pub profit_cancel_threshold_bps: f64,
+    /// Order refresh interval in seconds
+    pub order_refresh_interval_secs: u64,
+}
+
+impl ModeTradingConfig {
+    fn validate(&self, name: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.profit_rate_bps > 0.0 && self.profit_rate_bps <= 500.0,
+            "{}.profit_rate_bps must be in (0, 500]",
+            name
+        );
+        anyhow::ensure!(
+            self.order_notional_usd > 0.0 && self.order_notional_usd <= 1_000_000.0,
+            "{}.order_notional_usd must be in (0, 1_000_000]",
+            name
+        );
+        anyhow::ensure!(
+            self.profit_cancel_threshold_bps >= 0.0 && self.profit_cancel_threshold_bps <= 500.0,
+            "{}.profit_cancel_threshold_bps must be in [0, 500]",
+            name
+        );
+        anyhow::ensure!(
+            self.order_refresh_interval_secs > 0 && self.order_refresh_interval_secs <= 3600,
+            "{}.order_refresh_interval_secs must be in [1, 3600]",
+            name
+        );
+        Ok(())
+    }
+}
+
 /// Application configuration loaded from config.json
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -46,21 +92,60 @@ pub struct Config {
     #[serde(default = "default_hyperliquid_taker_fee")]
     pub hyperliquid_taker_fee_bps: f64,
 
+    /// Strategy mode:
+    /// - normal: only run normal profile
+    /// - event_only: only trade event profile after event trigger
+    /// - dual: normal + event switching
+    #[serde(default = "default_strategy_mode")]
+    pub strategy_mode: StrategyMode,
+
     /// Target profit rate in basis points (e.g., 10.0 = 0.1%)
+    /// Legacy single-profile field (used as fallback for normal_mode when missing).
     #[serde(default = "default_profit_rate")]
     pub profit_rate_bps: f64,
 
     /// Order notional size in USD (e.g., 20.0 = $20)
+    /// Legacy single-profile field (used as fallback for normal_mode when missing).
     #[serde(default = "default_order_notional")]
     pub order_notional_usd: f64,
 
     /// Profit cancel threshold in basis points (cancel if profit drops by this much)
+    /// Legacy single-profile field (used as fallback for normal_mode when missing).
     #[serde(default = "default_profit_cancel_threshold")]
     pub profit_cancel_threshold_bps: f64,
 
     /// Order refresh interval in seconds (cancel and replace if order is this old)
+    /// Legacy single-profile field (used as fallback for normal_mode when missing).
     #[serde(default = "default_order_refresh_interval")]
     pub order_refresh_interval_secs: u64,
+
+    /// Optional normal profile override. If omitted, legacy fields are used.
+    #[serde(default)]
+    pub normal_mode: Option<ModeTradingConfig>,
+
+    /// Optional event profile override. If omitted, derived from legacy fields.
+    #[serde(default)]
+    pub event_mode: Option<ModeTradingConfig>,
+
+    /// Event trigger threshold for |mid spread| in bps.
+    #[serde(default = "default_event_trigger_mid_spread_bps")]
+    pub event_trigger_mid_spread_bps: f64,
+
+    /// Event trigger threshold for Hyperliquid bid-ask spread width in bps.
+    #[serde(default = "default_event_trigger_hl_spread_bps")]
+    pub event_trigger_hl_spread_bps: f64,
+
+    /// Event trigger confirmation duration in seconds.
+    #[serde(default = "default_event_trigger_confirm_secs")]
+    pub event_trigger_confirm_secs: u64,
+
+    /// Cooldown before re-arming event mode.
+    #[serde(default = "default_event_rearm_cooldown_secs")]
+    pub event_rearm_cooldown_secs: u64,
+
+    /// Whether to keep running after each hedge cycle.
+    #[serde(default = "default_continuous_mode")]
+    pub continuous_mode: bool,
 
     /// Main opportunity loop interval in milliseconds.
     /// Larger values reduce API pressure and order trigger frequency.
@@ -149,6 +234,10 @@ fn default_hyperliquid_taker_fee() -> f64 {
     4.0 // 4 bps = 0.04%
 }
 
+fn default_strategy_mode() -> StrategyMode {
+    StrategyMode::Dual
+}
+
 fn default_profit_rate() -> f64 {
     15.0 // 15 bps = 0.15%
 }
@@ -163,6 +252,26 @@ fn default_profit_cancel_threshold() -> f64 {
 
 fn default_order_refresh_interval() -> u64 {
     60 // 60 seconds
+}
+
+fn default_event_trigger_mid_spread_bps() -> f64 {
+    100.0
+}
+
+fn default_event_trigger_hl_spread_bps() -> f64 {
+    4.0
+}
+
+fn default_event_trigger_confirm_secs() -> u64 {
+    2
+}
+
+fn default_event_rearm_cooldown_secs() -> u64 {
+    120
+}
+
+fn default_continuous_mode() -> bool {
+    true
 }
 
 fn default_evaluation_loop_interval_ms() -> u64 {
@@ -230,10 +339,18 @@ impl Default for Config {
             low_latency_mode: default_low_latency(),
             pacifica_maker_fee_bps: default_pacifica_maker_fee(),
             hyperliquid_taker_fee_bps: default_hyperliquid_taker_fee(),
+            strategy_mode: default_strategy_mode(),
             profit_rate_bps: default_profit_rate(),
             order_notional_usd: default_order_notional(),
             profit_cancel_threshold_bps: default_profit_cancel_threshold(),
             order_refresh_interval_secs: default_order_refresh_interval(),
+            normal_mode: None,
+            event_mode: None,
+            event_trigger_mid_spread_bps: default_event_trigger_mid_spread_bps(),
+            event_trigger_hl_spread_bps: default_event_trigger_hl_spread_bps(),
+            event_trigger_confirm_secs: default_event_trigger_confirm_secs(),
+            event_rearm_cooldown_secs: default_event_rearm_cooldown_secs(),
+            continuous_mode: default_continuous_mode(),
             evaluation_loop_interval_ms: default_evaluation_loop_interval_ms(),
             order_failure_cooldown_ms: default_order_failure_cooldown_ms(),
             post_only_reject_cooldown_ms: default_post_only_reject_cooldown_ms(),
@@ -260,6 +377,30 @@ impl Config {
     /// Effective hedge symbol (hedge_symbol if set, otherwise legacy symbol).
     pub fn hedge_symbol_str(&self) -> &str {
         self.hedge_symbol.as_deref().unwrap_or(&self.symbol)
+    }
+
+    pub fn normal_mode_config(&self) -> ModeTradingConfig {
+        self.normal_mode.clone().unwrap_or(ModeTradingConfig {
+            profit_rate_bps: self.profit_rate_bps,
+            order_notional_usd: self.order_notional_usd,
+            profit_cancel_threshold_bps: self.profit_cancel_threshold_bps,
+            order_refresh_interval_secs: self.order_refresh_interval_secs,
+        })
+    }
+
+    pub fn event_mode_config(&self) -> ModeTradingConfig {
+        self.event_mode.clone().unwrap_or_else(|| {
+            let profit_rate_bps = (self.profit_rate_bps + 10.0).max(self.profit_rate_bps * 1.6);
+            let profit_cancel_threshold_bps =
+                (self.profit_cancel_threshold_bps + 2.0).max(self.profit_cancel_threshold_bps);
+            let order_refresh_interval_secs = self.order_refresh_interval_secs.max(30);
+            ModeTradingConfig {
+                profit_rate_bps,
+                order_notional_usd: self.order_notional_usd,
+                profit_cancel_threshold_bps,
+                order_refresh_interval_secs,
+            }
+        })
     }
 
     /// Load configuration from a JSON file
@@ -330,6 +471,41 @@ impl Config {
         anyhow::ensure!(
             self.reconnect_attempts > 0,
             "Reconnect attempts must be greater than 0"
+        );
+
+        anyhow::ensure!(
+            self.profit_rate_bps > 0.0 && self.profit_rate_bps <= 500.0,
+            "profit_rate_bps must be in (0, 500]"
+        );
+        anyhow::ensure!(
+            self.order_notional_usd > 0.0 && self.order_notional_usd <= 1_000_000.0,
+            "order_notional_usd must be in (0, 1_000_000]"
+        );
+        anyhow::ensure!(
+            self.profit_cancel_threshold_bps >= 0.0 && self.profit_cancel_threshold_bps <= 500.0,
+            "profit_cancel_threshold_bps must be in [0, 500]"
+        );
+        anyhow::ensure!(
+            self.order_refresh_interval_secs > 0 && self.order_refresh_interval_secs <= 3600,
+            "order_refresh_interval_secs must be in [1, 3600]"
+        );
+        self.normal_mode_config().validate("normal_mode")?;
+        self.event_mode_config().validate("event_mode")?;
+        anyhow::ensure!(
+            self.event_trigger_mid_spread_bps > 0.0 && self.event_trigger_mid_spread_bps <= 5000.0,
+            "event_trigger_mid_spread_bps must be in (0, 5000]"
+        );
+        anyhow::ensure!(
+            self.event_trigger_hl_spread_bps > 0.0 && self.event_trigger_hl_spread_bps <= 1000.0,
+            "event_trigger_hl_spread_bps must be in (0, 1000]"
+        );
+        anyhow::ensure!(
+            self.event_trigger_confirm_secs > 0 && self.event_trigger_confirm_secs <= 120,
+            "event_trigger_confirm_secs must be in [1, 120]"
+        );
+        anyhow::ensure!(
+            self.event_rearm_cooldown_secs <= 7200,
+            "event_rearm_cooldown_secs must be <= 7200"
         );
 
         anyhow::ensure!(

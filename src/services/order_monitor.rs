@@ -54,6 +54,8 @@ pub struct OrderSnapshot {
     pub size: f64,
     pub initial_profit_bps: f64,
     pub placed_at: Instant,
+    pub profit_cancel_threshold_bps: f64,
+    pub order_refresh_interval_secs: u64,
 }
 
 /// Shared order snapshot updated atomically by order placer
@@ -191,15 +193,10 @@ impl OrderMonitorService {
     pub async fn run_monitor_loop(&self) {
         let mut monitor_interval = interval(Duration::from_millis(1));
         
-        // Timing thresholds
-        let age_threshold = Duration::from_secs(self.config.order_refresh_interval_secs);
-        let profit_threshold = self.config.profit_cancel_threshold_bps;
         // Reduce churn: once age threshold is reached, wait 3s then evaluate.
         let age_cancel_decision_grace = Duration::from_secs(3);
         // Keep waiting if current edge drift is still small.
         let age_cancel_keep_waiting_deviation_bps = 10.0_f64;
-        // Hard cap to avoid waiting forever.
-        let age_cancel_hard_cap = age_threshold + Duration::from_secs(120);
         let mut tracked_client_order_id: Option<String> = None;
         let mut age_threshold_reached_at: Option<Instant> = None;
         let mut age_cancel_sent_for_current_order = false;
@@ -246,6 +243,9 @@ impl OrderMonitorService {
             // Consistent calculation: positive = profit dropped (bad)
             let profit_change = snapshot.initial_profit_bps - current_profit;
             let profit_deviation = profit_change.abs();
+            let age_threshold = Duration::from_secs(snapshot.order_refresh_interval_secs);
+            let age_cancel_hard_cap = age_threshold + Duration::from_secs(120);
+            let profit_threshold = snapshot.profit_cancel_threshold_bps;
 
             // Check 1: Age threshold with anti-churn logic
             if age > age_threshold {
@@ -277,7 +277,7 @@ impl OrderMonitorService {
                     format!(
                         "age {}ms > {}s threshold and deviation {:.2} bps > {:.2} bps",
                         age.as_millis(),
-                        self.config.order_refresh_interval_secs,
+                        snapshot.order_refresh_interval_secs,
                         profit_deviation,
                         age_cancel_keep_waiting_deviation_bps
                     )
@@ -586,6 +586,8 @@ pub fn update_order_snapshot(
     size: f64,
     initial_profit_bps: f64,
     placed_at: Instant,
+    profit_cancel_threshold_bps: f64,
+    order_refresh_interval_secs: u64,
 ) {
     snapshot.set(Some(OrderSnapshot {
         client_order_id,
@@ -594,6 +596,8 @@ pub fn update_order_snapshot(
         size,
         initial_profit_bps,
         placed_at,
+        profit_cancel_threshold_bps,
+        order_refresh_interval_secs,
     }));
 }
 

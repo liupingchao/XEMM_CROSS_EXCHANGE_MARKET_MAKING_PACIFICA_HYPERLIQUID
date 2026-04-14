@@ -883,13 +883,21 @@ impl HedgeService {
                         info!("");
                     }
 
-                    // Mark cycle as complete AFTER displaying profit AND final cancellation
+                    // Mark cycle completion AFTER displaying profit AND final cancellation.
                     let mut state = self.bot_state.write().await;
-                    state.mark_complete();
-                    drop(state);
-
-                    // Signal shutdown
-                    self.shutdown_tx.send(()).await.ok();
+                    if self.config.continuous_mode {
+                        state.mark_cycle_complete_continue();
+                        drop(state);
+                        info!(
+                            "{} {} Cycle completed, returning to Idle (continuous mode)",
+                            format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                            "✓".green().bold()
+                        );
+                    } else {
+                        state.mark_complete();
+                        drop(state);
+                        self.shutdown_tx.send(()).await.ok();
+                    }
                 }
                 Err(e) => {
                     error!("{} {} Hedge failed: {}",
