@@ -505,20 +505,12 @@ impl HedgeService {
                         );
                     }
 
-                    // Get expected profit from active order before marking complete
+                    // Snapshot data needed for post-hedge audit before resetting state
                     let expected_profit_bps = {
                         let state = self.bot_state.read().await;
                         state.active_order.as_ref().map(|o| o.initial_profit_bps)
                     };
-
-                    // Wait for trades to propagate to exchange APIs (20 seconds)
-                    info!("{} Waiting 20 seconds for trades to propagate to APIs...",
-                        format!("[{} PROFIT]", self.config.symbol).bright_blue().bold()
-                    );
-                    tokio::time::sleep(Duration::from_secs(20)).await;
-
-                    // Get maker order ids from bot state
-                    let (client_order_id, maker_order_id) = {
+                    let (snapshot_client_order_id, snapshot_maker_order_id) = {
                         let state = self.bot_state.read().await;
                         (
                             state.active_order.as_ref().map(|o| o.client_order_id.clone()),
@@ -526,396 +518,67 @@ impl HedgeService {
                         )
                     };
 
-                    // Fetch maker trade history with retry logic
-                    let (maker_fill_price, maker_actual_fee, maker_notional): (Option<f64>, Option<f64>, Option<f64>) =
-                        if client_order_id.is_some() || maker_order_id.is_some() {
-                            let result = trade_fetcher::fetch_maker_trade(
-                                self.maker_exchange.clone(),
-                                &self.maker_symbol,
-                                client_order_id.as_deref(),
-                                maker_order_id.as_deref(),
-                                3, // max_attempts
-                                |msg| {
-                                    info!(
-                                        "{} {}",
-                                        format!("[{} PROFIT]", self.config.symbol).bright_blue().bold(),
-                                        msg
-                                    );
-                                },
-                            )
-                            .await;
-                            (result.fill_price, result.actual_fee, result.total_notional)
-                        } else {
-                            (None, None, None)
-                        };
-
-                    // Fetch Hyperliquid user fills with retry logic
-                    let hl_wallet = self.hl_wallet.clone();
-                    let (hl_fill_price, hl_actual_fee, hl_notional): (Option<f64>, Option<f64>, Option<f64>) = {
-                        let result = trade_fetcher::fetch_hyperliquid_fills(
-                            &self.hyperliquid_trading,
-                            &hl_wallet,
-                            &self.hedge_symbol,
-                            3, // max_attempts
-                            30, // time_window_secs
-                            |msg| {
-                                info!("{} {}",
-                                    format!("[{} PROFIT]", self.config.symbol).bright_blue().bold(),
-                                    msg
-                                );
-                            }
-                        ).await;
-                        (result.fill_price, result.actual_fee, result.total_notional)
-                    };
-
-                    // Calculate actual profitability using real fill data and actual fees
-                    let (actual_profit_bps, actual_profit_usd, maker_actual_price, hl_actual_price, maker_fee_usd, hl_fee_usd) =
-                        match (maker_notional, hl_notional, maker_fill_price, hl_fill_price) {
-                            (Some(pac_notional), Some(hl_notional), pac_price_opt, hl_price_opt) => {
-                                // Use ACTUAL notional values from exchanges (not recalculated!)
-                                // This handles multi-fill trades correctly
-
-                                // Use actual fees from trade history, or fall back to theoretical
-                                let pac_fee = maker_actual_fee.unwrap_or_else(|| {
-                                    // Fallback: 1.5 bps on notional
-                                    pac_notional * (self.config.pacifica_maker_fee_bps / 10000.0)
-                                });
-
-                                let hl_fee = hl_actual_fee.unwrap_or_else(|| {
-                                    // Fallback: 4 bps on notional
-                                    hl_notional * (self.config.hyperliquid_taker_fee_bps / 10000.0)
-                                });
-
-                                // Use the shared profit calculation function (same as test utility!)
-                                let is_pacifica_buy = matches!(side, OrderSide::Buy);
-                                let profit = trade_fetcher::calculate_hedge_profit(
-                                    pac_notional,
-                                    hl_notional,
-                                    pac_fee,
-                                    hl_fee,
-                                    is_pacifica_buy,
-                                );
-
-                                (profit.profit_bps, profit.net_profit, pac_price_opt, hl_price_opt, pac_fee, hl_fee)
-                            }
-                            _ => {
-                                // Fallback to fill event data if trade history unavailable
-                                warn!("{} {} Using fill event data (trade history unavailable)",
-                                    format!("[{} PROFIT]", self.config.symbol).bright_blue().bold(),
-                                    "⚠".yellow().bold()
-                                );
-
-                                // Calculate profit using fill event prices and estimated fees
-                                let hl_price = hedge_fill_price;
-                                let pac_price = avg_price;
-
-                                // Estimate fees using configured rates
-                                let pac_fee = pac_price * size * (self.config.pacifica_maker_fee_bps / 10000.0);
-                                let hl_fee = hl_price * size * (self.config.hyperliquid_taker_fee_bps / 10000.0);
-
-                                // Calculate profit
-                                let (profit_usd, cost, _revenue) = match side {
-                                    OrderSide::Buy => {
-                                        // Bought on Pacifica (maker), Sold on Hyperliquid (taker)
-                                        let cost = (pac_price * size) + pac_fee;
-                                        let revenue = (hl_price * size) - hl_fee;
-                                        (revenue - cost, cost, revenue)
-                                    }
-                                    OrderSide::Sell => {
-                                        // Sold on Pacifica (maker), Bought on Hyperliquid (taker)
-                                        let revenue = (pac_price * size) - pac_fee;
-                                        let cost = (hl_price * size) + hl_fee;
-                                        (revenue - cost, cost, revenue)
-                                    }
-                                };
-
-                                let profit_rate = if cost > 0.0 { profit_usd / cost } else { 0.0 };
-                                let profit_bps = profit_rate * 10000.0;
-
-                                (profit_bps, profit_usd, Some(pac_price), Some(hl_price), pac_fee, hl_fee)
-                            }
-                        };
-
-                    // Log trade to CSV file
-                    if maker_actual_price.is_some() && hl_actual_price.is_some() {
-                        let trade_record = csv_logger::TradeRecord::new(
-                            Utc::now(),
-                            end_to_end_latency.as_secs_f64() * 1000.0,  // Convert to milliseconds
-                            self.maker_symbol.clone(),
-                            side,
-                            maker_actual_price.unwrap(),
-                            size,
-                            maker_notional.unwrap_or(maker_actual_price.unwrap() * size),
-                            maker_fee_usd,
-                            hl_actual_price.unwrap(),
-                            size,
-                            hl_notional.unwrap_or(hl_actual_price.unwrap() * size),
-                            hl_fee_usd,
-                            expected_profit_bps.unwrap_or(0.0),
-                            actual_profit_bps,
-                            actual_profit_usd,
-                        );
-
-                        let csv_file = format!("{}_trades.csv", self.maker_symbol.to_lowercase());
-                        if let Err(e) = csv_logger::log_trade(&csv_file, &trade_record) {
-                            warn!("{} {} Failed to log trade to CSV: {}",
-                                format!("[{} CSV]", self.config.symbol).bright_yellow().bold(),
-                                "⚠".yellow().bold(),
-                                e
-                            );
-                        } else {
-                            info!("{} {} Trade logged to {}",
-                                format!("[{} CSV]", self.config.symbol).bright_green().bold(),
-                                "✓".green().bold(),
-                                csv_file
-                            );
-                        }
-                    }
-
-                    // Display comprehensive summary
-                    info!("{}", "═══════════════════════════════════════════════════".green().bold());
-                    info!("{}", "  BOT CYCLE COMPLETE!".green().bold());
-                    info!("{}", "═══════════════════════════════════════════════════".green().bold());
-                    info!("");
-                    info!("{}", "📊 TRADE SUMMARY:".bright_white().bold());
-                    if let Some(maker_price) = maker_actual_price {
-                        info!("  {}: {} {} {} @ {} {}",
-                            self.maker_exchange.name().bright_magenta(),
-                            side.as_str().bright_yellow(),
-                            format!("{:.4}", size).bright_white(),
-                            self.maker_symbol.bright_white().bold(),
-                            format!("${:.6}", maker_price).cyan().bold(),
-                            "(actual fill)".bright_black()
-                        );
-                    }
-                    if let Some(hl_price) = hl_actual_price {
-                        info!("  {}: {} {} {} @ {} {}",
-                            "Hyperliquid".bright_magenta(),
-                            if is_buy { "BUY".green() } else { "SELL".red() },
-                            format!("{:.4}", size).bright_white(),
-                            self.hedge_symbol.bright_white().bold(),
-                            format!("${:.6}", hl_price).cyan().bold(),
-                            "(actual fill)".bright_black()
-                        );
-                    }
-                    info!("");
-                    info!("{}", "💰 PROFITABILITY:".bright_white().bold());
-                    if let Some(expected) = expected_profit_bps {
-                        info!("  Expected: {} bps", format!("{:.2}", expected).bright_white());
-                    }
-                    if maker_actual_price.is_some() && hl_actual_price.is_some() {
-                        let profit_color = if actual_profit_bps > 0.0 { format!("{:.2}", actual_profit_bps).green().bold() } else { format!("{:.2}", actual_profit_bps).red().bold() };
-                        let usd_color = if actual_profit_usd > 0.0 { format!("${:.4}", actual_profit_usd).green().bold() } else { format!("${:.4}", actual_profit_usd).red().bold() };
-                        info!("  Actual:   {} bps ({})", profit_color, usd_color);
-                        if let Some(expected) = expected_profit_bps {
-                            let diff = actual_profit_bps - expected;
-                            let diff_sign = if diff >= 0.0 { "+" } else { "" };
-                            let diff_color = if diff >= 0.0 { format!("{}{:.2}", diff_sign, diff).green() } else { format!("{:.2}", diff).red() };
-                            info!("  Difference: {} bps", diff_color);
-                        }
-                    } else {
-                        warn!("  {} Unable to calculate actual profit (trade history unavailable)", "⚠".yellow().bold());
-                    }
-                    info!("");
-                    info!("{}", "📈 FEES:".bright_white().bold());
-                    if maker_actual_price.is_some() && hl_actual_price.is_some() {
-                        // Show actual fees paid
-                        info!("  {}: {} {}",
-                            self.maker_exchange.name(),
-                            format!("${:.4}", maker_fee_usd).yellow(),
-                            if maker_actual_fee.is_some() { "(actual)" } else { "(estimated)" }.bright_black()
-                        );
-                        info!("  Hyperliquid: {} {}",
-                            format!("${:.4}", hl_fee_usd).yellow(),
-                            if hl_actual_fee.is_some() { "(actual)" } else { "(estimated)" }.bright_black()
-                        );
-                        info!("  Total: {}", format!("${:.4}", maker_fee_usd + hl_fee_usd).yellow().bold());
-                    } else {
-                        // Fallback to theoretical fees
-                        info!("  {} (maker): {} bps", self.maker_exchange.name(), format!("{:.2}", self.config.pacifica_maker_fee_bps).yellow());
-                        info!("  Hyperliquid (taker): {} bps", format!("{:.2}", self.config.hyperliquid_taker_fee_bps).yellow());
-                        info!("  Total fees: {} bps", format!("{:.2}", self.config.pacifica_maker_fee_bps + self.config.hyperliquid_taker_fee_bps).yellow().bold());
-                    }
-                    info!("{}", "═══════════════════════════════════════════════════".green().bold());
-
-                    // *** CRITICAL: FINAL SAFETY CANCELLATION ***
-                    // Cancel all orders one last time before marking complete
-                    // This ensures no stray orders remain active
-                    info!("");
-                    info!("{} {} Post-hedge safety: Final cancellation of all maker orders...",
-                        format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                        "⚡".yellow().bold()
-                    );
-
-                    if let Err(e) = self.maker_exchange.cancel_all_orders(Some(&self.maker_symbol)).await
-                    {
-                        warn!("{} {} Failed to cancel orders after hedge completion: {}",
-                            format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                            "⚠".yellow().bold(),
-                            e
-                        );
-                    } else {
-                        info!("{} {} Final cancellation complete",
-                            format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                            "✓".green().bold()
-                        );
-                    }
-
-                    // *** POST-HEDGE POSITION VERIFICATION ***
-                    // Wait for positions to propagate and verify net position is neutral
-                    info!("");
-                    info!("{} {} Post-hedge verification: Waiting 8 seconds for positions to propagate...",
-                        format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
-                        "⏱".cyan().bold()
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
-
-                    info!("{} Verifying final positions on both exchanges...",
-                        format!("[{} VERIFY]", self.config.symbol).cyan().bold()
-                    );
-
-                    // Check maker exchange position
-                    let maker_position = match self.maker_exchange.get_positions(Some(&self.maker_symbol)).await {
-                        Ok(positions) => {
-                            if let Some(pos) = positions.first() {
-                                let signed_amount = pos.signed_amount();
-                                info!("{} {}: {:.4} {} (signed: {:.4})",
-                                    format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
-                                    self.maker_exchange.name(),
-                                    pos.amount,
-                                    pos.side.as_str(),
-                                    signed_amount
-                                );
-                                Some(signed_amount)
-                            } else {
-                                info!("{} {}: No position (flat)",
-                                    format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
-                                    self.maker_exchange.name()
-                                );
-                                Some(0.0)
-                            }
-                        }
-                        Err(e) => {
-                            warn!("{} {} Failed to fetch maker position: {}",
-                                format!("[{} VERIFY]", self.config.symbol).yellow().bold(),
-                                "⚠".yellow().bold(),
-                                e
-                            );
-                            None
-                        }
-                    };
-
-                    // Check Hyperliquid position
-                    let hl_wallet = self.hl_wallet.clone();
-                    let mut hyperliquid_position: Option<f64> = None;
-
-                    // Try up to 3 times with delays if position not found
-                    for retry in 0..3 {
-                        if retry > 0 {
-                            info!("{} Retry {} - waiting 3 more seconds for Hyperliquid position...",
-                                format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
-                                retry
-                            );
-                            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-                        }
-
-                        match self.hyperliquid_trading.get_user_state(&hl_wallet).await {
-                            Ok(user_state) => {
-                                if let Some(asset_pos) = user_state.asset_positions.iter().find(|ap| ap.position.coin == self.hedge_symbol) {
-                                    let szi: f64 = parse(&asset_pos.position.szi).unwrap_or(0.0);
-                                    info!("{} Hyperliquid: {} (signed: {:.4})",
-                                        format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
-                                        if szi > 0.0 { "LONG".green() } else if szi < 0.0 { "SHORT".red() } else { "FLAT".bright_white() },
-                                        szi
-                                    );
-                                    hyperliquid_position = Some(szi);
-                                    break;
-                                } else if retry == 2 {
-                                    info!("{} Hyperliquid: No position found after 3 attempts (flat)",
-                                        format!("[{} VERIFY]", self.config.symbol).cyan().bold()
-                                    );
-                                    hyperliquid_position = Some(0.0);
-                                }
-                            }
-                            Err(e) => {
-                                if retry == 2 {
-                                    warn!("{} {} Failed to fetch Hyperliquid position after 3 attempts: {}",
-                                        format!("[{} VERIFY]", self.config.symbol).yellow().bold(),
-                                        "⚠".yellow().bold(),
-                                        e
-                                    );
-                                    hyperliquid_position = None;
-                                }
-                            }
-                        }
-                    }
-
-                    // Calculate net position across both exchanges
-                    if let (Some(maker_pos), Some(hl_pos)) = (maker_position, hyperliquid_position) {
-                        let net_position = maker_pos + hl_pos;
-
-                        info!("");
-                        info!("{} Net Position: {:.4} ({}: {:.4} + Hyperliquid: {:.4})",
-                            format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
-                            net_position,
-                            self.maker_exchange.name(),
-                            maker_pos,
-                            hl_pos
-                        );
-
-                        // Check if net position is close to neutral
-                        if net_position.abs() < 0.01 {
-                            info!("{} {} Net position is NEUTRAL (properly hedged across both exchanges)",
-                                format!("[{} VERIFY]", self.config.symbol).cyan().bold(),
-                                "✓".green().bold()
-                            );
-                        } else {
-                            info!("");
-                            warn!("{}", "⚠".repeat(80).yellow());
-                            warn!("{} {} WARNING: Net position NOT neutral!",
-                                format!("[{} VERIFY]", self.config.symbol).red().bold(),
-                                "⚠".yellow().bold()
-                            );
-                            warn!("{} Position delta: {:.4} {}",
-                                format!("[{} VERIFY]", self.config.symbol).red().bold(),
-                                net_position.abs(),
-                                format!("{}|{}", self.maker_symbol, self.hedge_symbol)
-                            );
-                            warn!("{} This indicates a potential hedge failure or partial fill.",
-                                format!("[{} VERIFY]", self.config.symbol).red().bold()
-                            );
-                            warn!("{} Please check positions manually and rebalance if needed!",
-                                format!("[{} VERIFY]", self.config.symbol).red().bold()
-                            );
-                            warn!("{}", "⚠".repeat(80).yellow());
-                            info!("");
-                        }
-                    } else {
-                        info!("");
-                        warn!("{} {} WARNING: Could not verify net position!",
-                            format!("[{} VERIFY]", self.config.symbol).yellow().bold(),
-                            "⚠".yellow().bold()
-                        );
-                        warn!("{} Failed to fetch positions from one or both exchanges.",
-                            format!("[{} VERIFY]", self.config.symbol).yellow().bold()
-                        );
-                        warn!("{} Please check positions manually!",
-                            format!("[{} VERIFY]", self.config.symbol).yellow().bold()
-                        );
-                        info!("");
-                    }
-
-                    // Mark cycle completion AFTER displaying profit AND final cancellation.
-                    let mut state = self.bot_state.write().await;
+                    // In continuous mode: return to Idle IMMEDIATELY so the next
+                    // cycle can start while post-hedge audit runs in background.
+                    // In single-shot mode: keep synchronous behavior (bot exits anyway).
                     if self.config.continuous_mode {
+                        let mut state = self.bot_state.write().await;
                         state.mark_cycle_complete_continue();
                         drop(state);
                         info!(
-                            "{} {} Cycle completed, returning to Idle (continuous mode)",
+                            "{} {} Cycle completed, returning to Idle (continuous mode, audit runs in background)",
                             format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                             "✓".green().bold()
                         );
+
+                        // Spawn background task for post-hedge audit & verification
+                        let bg_config = self.config.clone();
+                        let bg_maker_symbol = self.maker_symbol.clone();
+                        let bg_hedge_symbol = self.hedge_symbol.clone();
+                        let bg_hl_wallet = self.hl_wallet.clone();
+                        let bg_maker_exchange = self.maker_exchange.clone();
+                        let bg_hl_trading = self.hyperliquid_trading.clone();
+
+                        tokio::spawn(async move {
+                            Self::post_hedge_audit(
+                                bg_config,
+                                bg_maker_symbol,
+                                bg_hedge_symbol,
+                                bg_hl_wallet,
+                                bg_maker_exchange,
+                                bg_hl_trading,
+                                side,
+                                is_buy,
+                                size,
+                                avg_price,
+                                hedge_fill_price,
+                                end_to_end_latency,
+                                expected_profit_bps,
+                                snapshot_client_order_id,
+                                snapshot_maker_order_id,
+                            ).await;
+                        });
                     } else {
+                        // Single-shot mode: run audit synchronously then shutdown
+                        Self::post_hedge_audit(
+                            self.config.clone(),
+                            self.maker_symbol.clone(),
+                            self.hedge_symbol.clone(),
+                            self.hl_wallet.clone(),
+                            self.maker_exchange.clone(),
+                            self.hyperliquid_trading.clone(),
+                            side,
+                            is_buy,
+                            size,
+                            avg_price,
+                            hedge_fill_price,
+                            end_to_end_latency,
+                            expected_profit_bps,
+                            snapshot_client_order_id,
+                            snapshot_maker_order_id,
+                        ).await;
+
+                        let mut state = self.bot_state.write().await;
                         state.mark_complete();
                         drop(state);
                         self.shutdown_tx.send(()).await.ok();
@@ -962,6 +625,304 @@ impl HedgeService {
                 } // Close Some((side, size, avg_price, fill_timestamp)) arm
             } // Close tokio::select!
         } // Close loop
+    }
+
+    /// Post-hedge audit: fetch trade history, calculate actual profit, log CSV,
+    /// cancel remaining orders, and verify positions.
+    ///
+    /// In continuous mode this runs as a background task so the next cycle can
+    /// start immediately after a successful hedge.
+    async fn post_hedge_audit(
+        config: Config,
+        maker_symbol: String,
+        hedge_symbol: String,
+        hl_wallet: String,
+        maker_exchange: Arc<dyn MakerExchange>,
+        hyperliquid_trading: Arc<HyperliquidTrading>,
+        side: OrderSide,
+        is_buy: bool,
+        size: f64,
+        avg_price: f64,
+        hedge_fill_price: f64,
+        end_to_end_latency: Duration,
+        expected_profit_bps: Option<f64>,
+        client_order_id: Option<String>,
+        maker_order_id: Option<String>,
+    ) {
+        let symbol_tag = config.symbol.clone();
+
+        // Wait for trades to propagate to exchange APIs
+        info!("{} Waiting 20 seconds for trades to propagate to APIs...",
+            format!("[{} PROFIT]", symbol_tag).bright_blue().bold()
+        );
+        tokio::time::sleep(Duration::from_secs(20)).await;
+
+        // Fetch maker trade history with retry logic
+        let (maker_fill_price, maker_actual_fee, maker_notional): (Option<f64>, Option<f64>, Option<f64>) =
+            if client_order_id.is_some() || maker_order_id.is_some() {
+                let symbol_tag2 = symbol_tag.clone();
+                let result = trade_fetcher::fetch_maker_trade(
+                    maker_exchange.clone(),
+                    &maker_symbol,
+                    client_order_id.as_deref(),
+                    maker_order_id.as_deref(),
+                    3,
+                    move |msg| {
+                        info!("{} {}",
+                            format!("[{} PROFIT]", symbol_tag2).bright_blue().bold(),
+                            msg
+                        );
+                    },
+                )
+                .await;
+                (result.fill_price, result.actual_fee, result.total_notional)
+            } else {
+                (None, None, None)
+            };
+
+        // Fetch Hyperliquid user fills with retry logic
+        let symbol_tag3 = symbol_tag.clone();
+        let (hl_fill_price, hl_actual_fee, hl_notional): (Option<f64>, Option<f64>, Option<f64>) = {
+            let result = trade_fetcher::fetch_hyperliquid_fills(
+                &hyperliquid_trading,
+                &hl_wallet,
+                &hedge_symbol,
+                3,
+                30,
+                move |msg| {
+                    info!("{} {}",
+                        format!("[{} PROFIT]", symbol_tag3).bright_blue().bold(),
+                        msg
+                    );
+                }
+            ).await;
+            (result.fill_price, result.actual_fee, result.total_notional)
+        };
+
+        // Calculate actual profitability
+        let (actual_profit_bps, actual_profit_usd, maker_actual_price, hl_actual_price, maker_fee_usd, hl_fee_usd) =
+            match (maker_notional, hl_notional, maker_fill_price, hl_fill_price) {
+                (Some(pac_notional), Some(hl_notional), pac_price_opt, hl_price_opt) => {
+                    let pac_fee = maker_actual_fee.unwrap_or_else(|| {
+                        pac_notional * (config.pacifica_maker_fee_bps / 10000.0)
+                    });
+                    let hl_fee = hl_actual_fee.unwrap_or_else(|| {
+                        hl_notional * (config.hyperliquid_taker_fee_bps / 10000.0)
+                    });
+                    let is_pacifica_buy = matches!(side, OrderSide::Buy);
+                    let profit = trade_fetcher::calculate_hedge_profit(
+                        pac_notional,
+                        hl_notional,
+                        pac_fee,
+                        hl_fee,
+                        is_pacifica_buy,
+                    );
+                    (profit.profit_bps, profit.net_profit, pac_price_opt, hl_price_opt, pac_fee, hl_fee)
+                }
+                _ => {
+                    warn!("{} {} Using fill event data (trade history unavailable)",
+                        format!("[{} PROFIT]", symbol_tag).bright_blue().bold(),
+                        "⚠".yellow().bold()
+                    );
+                    let hl_price = hedge_fill_price;
+                    let pac_price = avg_price;
+                    let pac_fee = pac_price * size * (config.pacifica_maker_fee_bps / 10000.0);
+                    let hl_fee = hl_price * size * (config.hyperliquid_taker_fee_bps / 10000.0);
+                    let (profit_usd, cost, _revenue) = match side {
+                        OrderSide::Buy => {
+                            let cost = (pac_price * size) + pac_fee;
+                            let revenue = (hl_price * size) - hl_fee;
+                            (revenue - cost, cost, revenue)
+                        }
+                        OrderSide::Sell => {
+                            let revenue = (pac_price * size) - pac_fee;
+                            let cost = (hl_price * size) + hl_fee;
+                            (revenue - cost, cost, revenue)
+                        }
+                    };
+                    let profit_rate = if cost > 0.0 { profit_usd / cost } else { 0.0 };
+                    let profit_bps = profit_rate * 10000.0;
+                    (profit_bps, profit_usd, Some(pac_price), Some(hl_price), pac_fee, hl_fee)
+                }
+            };
+
+        // Log trade to CSV
+        if maker_actual_price.is_some() && hl_actual_price.is_some() {
+            let trade_record = csv_logger::TradeRecord::new(
+                Utc::now(),
+                end_to_end_latency.as_secs_f64() * 1000.0,
+                maker_symbol.clone(),
+                side,
+                maker_actual_price.unwrap(),
+                size,
+                maker_notional.unwrap_or(maker_actual_price.unwrap() * size),
+                maker_fee_usd,
+                hl_actual_price.unwrap(),
+                size,
+                hl_notional.unwrap_or(hl_actual_price.unwrap() * size),
+                hl_fee_usd,
+                expected_profit_bps.unwrap_or(0.0),
+                actual_profit_bps,
+                actual_profit_usd,
+            );
+            let csv_file = format!("{}_trades.csv", maker_symbol.to_lowercase());
+            if let Err(e) = csv_logger::log_trade(&csv_file, &trade_record) {
+                warn!("{} {} Failed to log trade to CSV: {}",
+                    format!("[{} CSV]", symbol_tag).bright_yellow().bold(),
+                    "⚠".yellow().bold(),
+                    e
+                );
+            } else {
+                info!("{} {} Trade logged to {}",
+                    format!("[{} CSV]", symbol_tag).bright_green().bold(),
+                    "✓".green().bold(),
+                    csv_file
+                );
+            }
+        }
+
+        // Display comprehensive summary
+        info!("{}", "═══════════════════════════════════════════════════".green().bold());
+        info!("{}", "  CYCLE AUDIT COMPLETE".green().bold());
+        info!("{}", "═══════════════════════════════════════════════════".green().bold());
+        info!("");
+        info!("{}", "TRADE SUMMARY:".bright_white().bold());
+        if let Some(maker_price) = maker_actual_price {
+            info!("  {}: {} {} {} @ {} {}",
+                maker_exchange.name().bright_magenta(),
+                side.as_str().bright_yellow(),
+                format!("{:.4}", size).bright_white(),
+                maker_symbol.bright_white().bold(),
+                format!("${:.6}", maker_price).cyan().bold(),
+                "(actual fill)".bright_black()
+            );
+        }
+        if let Some(hl_price) = hl_actual_price {
+            info!("  {}: {} {} {} @ {} {}",
+                "Hyperliquid".bright_magenta(),
+                if is_buy { "BUY".green() } else { "SELL".red() },
+                format!("{:.4}", size).bright_white(),
+                hedge_symbol.bright_white().bold(),
+                format!("${:.6}", hl_price).cyan().bold(),
+                "(actual fill)".bright_black()
+            );
+        }
+        info!("");
+        info!("{}", "PROFITABILITY:".bright_white().bold());
+        if let Some(expected) = expected_profit_bps {
+            info!("  Expected: {} bps", format!("{:.2}", expected).bright_white());
+        }
+        if maker_actual_price.is_some() && hl_actual_price.is_some() {
+            let profit_color = if actual_profit_bps > 0.0 { format!("{:.2}", actual_profit_bps).green().bold() } else { format!("{:.2}", actual_profit_bps).red().bold() };
+            let usd_color = if actual_profit_usd > 0.0 { format!("${:.4}", actual_profit_usd).green().bold() } else { format!("${:.4}", actual_profit_usd).red().bold() };
+            info!("  Actual:   {} bps ({})", profit_color, usd_color);
+            if let Some(expected) = expected_profit_bps {
+                let diff = actual_profit_bps - expected;
+                let diff_sign = if diff >= 0.0 { "+" } else { "" };
+                let diff_color = if diff >= 0.0 { format!("{}{:.2}", diff_sign, diff).green() } else { format!("{:.2}", diff).red() };
+                info!("  Difference: {} bps", diff_color);
+            }
+        } else {
+            warn!("  {} Unable to calculate actual profit (trade history unavailable)", "⚠".yellow().bold());
+        }
+        info!("");
+        info!("{}", "FEES:".bright_white().bold());
+        if maker_actual_price.is_some() && hl_actual_price.is_some() {
+            info!("  {}: {} {}",
+                maker_exchange.name(),
+                format!("${:.4}", maker_fee_usd).yellow(),
+                if maker_actual_fee.is_some() { "(actual)" } else { "(estimated)" }.bright_black()
+            );
+            info!("  Hyperliquid: {} {}",
+                format!("${:.4}", hl_fee_usd).yellow(),
+                if hl_actual_fee.is_some() { "(actual)" } else { "(estimated)" }.bright_black()
+            );
+            info!("  Total: {}", format!("${:.4}", maker_fee_usd + hl_fee_usd).yellow().bold());
+        } else {
+            info!("  {} (maker): {} bps", maker_exchange.name(), format!("{:.2}", config.pacifica_maker_fee_bps).yellow());
+            info!("  Hyperliquid (taker): {} bps", format!("{:.2}", config.hyperliquid_taker_fee_bps).yellow());
+            info!("  Total fees: {} bps", format!("{:.2}", config.pacifica_maker_fee_bps + config.hyperliquid_taker_fee_bps).yellow().bold());
+        }
+        info!("{}", "═══════════════════════════════════════════════════".green().bold());
+
+        // Safety cancellation
+        info!("{} {} Post-hedge safety: Cancelling all maker orders...",
+            format!("[{} AUDIT]", symbol_tag).bright_magenta().bold(),
+            "⚡".yellow().bold()
+        );
+        if let Err(e) = maker_exchange.cancel_all_orders(Some(&maker_symbol)).await {
+            warn!("{} {} Failed to cancel orders after hedge: {}",
+                format!("[{} AUDIT]", symbol_tag).bright_magenta().bold(),
+                "⚠".yellow().bold(),
+                e
+            );
+        }
+
+        // Position verification
+        info!("{} Waiting 8 seconds for positions to propagate...",
+            format!("[{} AUDIT]", symbol_tag).bright_magenta().bold()
+        );
+        tokio::time::sleep(Duration::from_secs(8)).await;
+
+        let maker_position = match maker_exchange.get_positions(Some(&maker_symbol)).await {
+            Ok(positions) => {
+                if let Some(pos) = positions.first() {
+                    let signed_amount = pos.signed_amount();
+                    info!("{} {}: {:.4} {} (signed: {:.4})",
+                        format!("[{} VERIFY]", symbol_tag).cyan().bold(),
+                        maker_exchange.name(),
+                        pos.amount, pos.side.as_str(), signed_amount
+                    );
+                    Some(signed_amount)
+                } else {
+                    Some(0.0)
+                }
+            }
+            Err(e) => { warn!("[VERIFY] Failed to fetch maker position: {}", e); None }
+        };
+
+        let mut hyperliquid_position: Option<f64> = None;
+        for retry in 0..3 {
+            if retry > 0 {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+            match hyperliquid_trading.get_user_state(&hl_wallet).await {
+                Ok(user_state) => {
+                    if let Some(asset_pos) = user_state.asset_positions.iter().find(|ap| ap.position.coin == hedge_symbol) {
+                        let szi: f64 = parse(&asset_pos.position.szi).unwrap_or(0.0);
+                        info!("{} Hyperliquid: {} (signed: {:.4})",
+                            format!("[{} VERIFY]", symbol_tag).cyan().bold(),
+                            if szi > 0.0 { "LONG".green() } else if szi < 0.0 { "SHORT".red() } else { "FLAT".bright_white() },
+                            szi
+                        );
+                        hyperliquid_position = Some(szi);
+                        break;
+                    } else if retry == 2 {
+                        hyperliquid_position = Some(0.0);
+                    }
+                }
+                Err(e) => {
+                    if retry == 2 {
+                        warn!("[VERIFY] Failed to fetch Hyperliquid position after 3 attempts: {}", e);
+                    }
+                }
+            }
+        }
+
+        if let (Some(maker_pos), Some(hl_pos)) = (maker_position, hyperliquid_position) {
+            let net_position = maker_pos + hl_pos;
+            info!("{} Net Position: {:.4} ({}: {:.4} + Hyperliquid: {:.4})",
+                format!("[{} VERIFY]", symbol_tag).cyan().bold(),
+                net_position, maker_exchange.name(), maker_pos, hl_pos
+            );
+            if net_position.abs() >= 0.01 {
+                warn!("{}", "WARNING: Net position NOT neutral!".red().bold());
+                warn!("Position delta: {:.4} {}|{}", net_position.abs(), maker_symbol, hedge_symbol);
+                warn!("Check positions manually and rebalance if needed!");
+            }
+        } else {
+            warn!("[VERIFY] Could not verify net position - check manually");
+        }
     }
 
     /// Establish a Hyperliquid trading WebSocket connection for hedging.
