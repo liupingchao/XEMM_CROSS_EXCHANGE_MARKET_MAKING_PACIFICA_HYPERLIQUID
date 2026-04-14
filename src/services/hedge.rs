@@ -49,6 +49,7 @@ pub struct HedgeService {
     pub hyperliquid_trading: Arc<HyperliquidTrading>,
     pub maker_exchange: Arc<dyn MakerExchange>,
     pub shutdown_tx: mpsc::Sender<()>,
+    pub hl_wallet: String,
 }
 
 impl HedgeService {
@@ -347,12 +348,32 @@ impl HedgeService {
                         match status {
                             crate::connector::hyperliquid::OrderStatus::Filled { filled } => {
                                 let parsed_price = filled.avgPx.parse::<f64>().ok();
-                                let parsed_size = filled
-                                    .totalSz
-                                    .parse::<f64>()
-                                    .ok()
-                                    .filter(|v| *v > 0.0)
-                                    .unwrap_or(size);
+                                if parsed_price.is_none() {
+                                    warn!("{} {} Failed to parse hedge avgPx '{}' - fill price unknown",
+                                        format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                        "⚠".yellow().bold(),
+                                        filled.avgPx
+                                    );
+                                }
+                                let parsed_size = match filled.totalSz.parse::<f64>() {
+                                    Ok(v) if v > 0.0 => v,
+                                    Ok(v) => {
+                                        warn!("{} {} Hedge totalSz parsed as non-positive ({}) - falling back to requested size {}",
+                                            format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                            "⚠".yellow().bold(),
+                                            v, size
+                                        );
+                                        size
+                                    }
+                                    Err(e) => {
+                                        warn!("{} {} Failed to parse hedge totalSz '{}': {} - falling back to requested size {}",
+                                            format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
+                                            "⚠".yellow().bold(),
+                                            filled.totalSz, e, size
+                                        );
+                                        size
+                                    }
+                                };
                                 info!("{} {} Hedge executed successfully: Filled {} @ ${} | Total latency: {:.1}ms",
                                     format!("[{} HEDGE]", self.config.symbol).bright_magenta().bold(),
                                     "✓".green().bold(),
@@ -428,7 +449,8 @@ impl HedgeService {
                             return;
                         }
                     };
-                    let hedge_is_full_fill = hedge_fill_size + 1e-9 >= size;
+                    // Use relative tolerance: fill is "full" if >= 99.99% of requested size
+                    let hedge_is_full_fill = size <= 0.0 || (hedge_fill_size / size) >= 0.9999;
 
                     // Audit logging for hedge side (Hyperliquid): order + fill
                     let hedge_orders_csv = audit_logger::order_file_for_symbol(&self.hedge_symbol);
@@ -528,7 +550,7 @@ impl HedgeService {
                         };
 
                     // Fetch Hyperliquid user fills with retry logic
-                    let hl_wallet = std::env::var("HL_WALLET").unwrap_or_default();
+                    let hl_wallet = self.hl_wallet.clone();
                     let (hl_fill_price, hl_actual_fee, hl_notional): (Option<f64>, Option<f64>, Option<f64>) = {
                         let result = trade_fetcher::fetch_hyperliquid_fills(
                             &self.hyperliquid_trading,
@@ -784,7 +806,7 @@ impl HedgeService {
                     };
 
                     // Check Hyperliquid position
-                    let hl_wallet = std::env::var("HL_WALLET").unwrap_or_default();
+                    let hl_wallet = self.hl_wallet.clone();
                     let mut hyperliquid_position: Option<f64> = None;
 
                     // Try up to 3 times with delays if position not found

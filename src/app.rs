@@ -100,6 +100,9 @@ pub struct XemmBot {
 
     // Credentials (needed for spawning Pacifica-only services)
     pub pacifica_credentials: Option<PacificaCredentials>,
+
+    // Hyperliquid wallet address (validated at startup)
+    pub hl_wallet: String,
 }
 
 impl XemmBot {
@@ -285,6 +288,7 @@ impl XemmBot {
             _ => unreachable!("config.validate() already ensures valid maker_exchange"),
         };
 
+        let hl_wallet = hyperliquid_credentials.wallet.clone();
         let hyperliquid_trading = Arc::new(
             HyperliquidTrading::new(hyperliquid_credentials, false)
                 .context("Failed to create Hyperliquid trading client")?,
@@ -396,6 +400,7 @@ impl XemmBot {
             maker_exchange,
             pacifica_trading_fill,
             pacifica_ws_trading,
+            hl_wallet,
             hyperliquid_trading,
             pacifica_prices,
             hyperliquid_prices,
@@ -779,6 +784,7 @@ impl XemmBot {
             hyperliquid_trading: self.hyperliquid_trading.clone(),
             maker_exchange: self.maker_exchange.clone(),
             shutdown_tx: self.shutdown_tx.clone(),
+            hl_wallet: self.hl_wallet.clone(),
         };
         tokio::spawn(async move {
             hedge_service.run().await;

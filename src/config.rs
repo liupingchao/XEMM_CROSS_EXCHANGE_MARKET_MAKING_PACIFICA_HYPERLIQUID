@@ -473,6 +473,22 @@ impl Config {
             "Reconnect attempts must be greater than 0"
         );
 
+        // Validate financial parameters
+        anyhow::ensure!(
+            self.pacifica_maker_fee_bps >= 0.0,
+            "pacifica_maker_fee_bps cannot be negative (got {})",
+            self.pacifica_maker_fee_bps
+        );
+        anyhow::ensure!(
+            self.hyperliquid_taker_fee_bps >= 0.0,
+            "hyperliquid_taker_fee_bps cannot be negative (got {})",
+            self.hyperliquid_taker_fee_bps
+        );
+        anyhow::ensure!(
+            self.hyperliquid_slippage > 0.0 && self.hyperliquid_slippage < 0.5,
+            "hyperliquid_slippage must be between 0 and 0.5 (got {})",
+            self.hyperliquid_slippage
+        );
         anyhow::ensure!(
             self.profit_rate_bps > 0.0 && self.profit_rate_bps <= 500.0,
             "profit_rate_bps must be in (0, 500]"
@@ -579,5 +595,35 @@ mod tests {
 
         config.ping_interval_secs = 60;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_financial_param_validation() {
+        let mut config = Config::default();
+
+        // Negative fee should fail
+        config.pacifica_maker_fee_bps = -1.0;
+        assert!(config.validate().is_err());
+        config.pacifica_maker_fee_bps = 1.5;
+
+        // Zero profit rate should fail
+        config.profit_rate_bps = 0.0;
+        assert!(config.validate().is_err());
+        config.profit_rate_bps = 15.0;
+
+        // Zero notional should fail
+        config.order_notional_usd = 0.0;
+        assert!(config.validate().is_err());
+        config.order_notional_usd = 20.0;
+
+        // Slippage out of range should fail
+        config.hyperliquid_slippage = 0.5;
+        assert!(config.validate().is_err());
+        config.hyperliquid_slippage = 0.0;
+        assert!(config.validate().is_err());
+        config.hyperliquid_slippage = 0.05;
+
+        // Valid config should pass
+        assert!(config.validate().is_ok());
     }
 }

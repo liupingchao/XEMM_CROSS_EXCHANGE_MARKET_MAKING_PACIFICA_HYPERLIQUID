@@ -26,6 +26,7 @@ pub enum AtomicBotStatus {
     Filled = 2,
     Hedging = 3,
     Complete = 4,
+    Error = 5,
 }
 
 impl From<&BotStatus> for AtomicBotStatus {
@@ -36,7 +37,7 @@ impl From<&BotStatus> for AtomicBotStatus {
             BotStatus::Filled => AtomicBotStatus::Filled,
             BotStatus::Hedging => AtomicBotStatus::Hedging,
             BotStatus::Complete => AtomicBotStatus::Complete,
-            BotStatus::Error(_) => AtomicBotStatus::Idle, // Treat errors as idle for monitoring purposes
+            BotStatus::Error(_) => AtomicBotStatus::Error,
         }
     }
 }
@@ -240,9 +241,9 @@ impl OrderMonitorService {
                 hl_ask,
             );
             
-            // Consistent calculation: positive = profit dropped (bad)
-            let profit_change = snapshot.initial_profit_bps - current_profit;
-            let profit_deviation = profit_change.abs();
+            // Cancel only when profit has DROPPED (not when it improved).
+            // profit_drop > 0 means the opportunity got worse.
+            let profit_drop = snapshot.initial_profit_bps - current_profit;
             let age_threshold = Duration::from_secs(snapshot.order_refresh_interval_secs);
             let age_cancel_hard_cap = age_threshold + Duration::from_secs(120);
             let profit_threshold = snapshot.profit_cancel_threshold_bps;
@@ -251,7 +252,7 @@ impl OrderMonitorService {
             if age > age_threshold {
                 let since = age_threshold_reached_at.get_or_insert_with(Instant::now);
                 let decision_elapsed = since.elapsed();
-                let should_keep_waiting = profit_deviation <= age_cancel_keep_waiting_deviation_bps;
+                let should_keep_waiting = profit_drop.abs() <= age_cancel_keep_waiting_deviation_bps;
                 let hit_hard_cap = age >= age_cancel_hard_cap;
 
                 if age_cancel_sent_for_current_order {
@@ -271,14 +272,14 @@ impl OrderMonitorService {
                         "age hard cap {}s reached (age={}ms, deviation={:.2} bps)",
                         age_cancel_hard_cap.as_secs(),
                         age.as_millis(),
-                        profit_deviation
+                        profit_drop.abs()
                     )
                 } else {
                     format!(
                         "age {}ms > {}s threshold and deviation {:.2} bps > {:.2} bps",
                         age.as_millis(),
                         snapshot.order_refresh_interval_secs,
-                        profit_deviation,
+                        profit_drop.abs(),
                         age_cancel_keep_waiting_deviation_bps
                     )
                 };
@@ -295,12 +296,13 @@ impl OrderMonitorService {
                 age_threshold_reached_at = None;
             }
 
-            if profit_deviation > profit_threshold {
+            // Check 2: Profit deviation - only cancel when profit DROPPED
+            if profit_drop > profit_threshold {
                 // Send cancel request (non-blocking)
                 let _ = self.cancel_tx.try_send(CancelRequest::ProfitDeviation {
                     symbol: self.maker_symbol.clone(),
                     current_profit_bps: current_profit,
-                    deviation_bps: profit_deviation,
+                    deviation_bps: profit_drop,
                     client_order_id: snapshot.client_order_id.clone(),
                     placed_at: snapshot.placed_at,
                 });

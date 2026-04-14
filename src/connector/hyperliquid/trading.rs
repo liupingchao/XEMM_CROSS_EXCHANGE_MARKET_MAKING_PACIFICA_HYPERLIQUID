@@ -22,17 +22,26 @@ const TESTNET_EXCHANGE_URL: &str = "https://api.hyperliquid-testnet.xyz/exchange
 #[derive(Clone)]
 pub struct HyperliquidCredentials {
     pub private_key: String,
+    pub wallet: String,
 }
 
 impl HyperliquidCredentials {
     /// Load credentials from environment variables
-    /// Expects HL_PRIVATE_KEY
+    /// Expects HL_PRIVATE_KEY and HL_WALLET
     pub fn from_env() -> Result<Self> {
         let private_key = std::env::var("HL_PRIVATE_KEY")
             .context("HL_PRIVATE_KEY environment variable not set")?;
 
+        let wallet = std::env::var("HL_WALLET")
+            .context("HL_WALLET environment variable not set")?;
+        anyhow::ensure!(
+            !wallet.trim().is_empty(),
+            "HL_WALLET environment variable is empty"
+        );
+
         Ok(Self {
             private_key,
+            wallet,
         })
     }
 }

@@ -123,54 +123,64 @@ impl PacificaWsTrading {
         debug!("[PACIFICA_WS] Sending request: {}", request_json);
         write.send(Message::Text(request_json)).await?;
 
-        // Wait for response with matching ID
-        while let Some(msg) = read.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    debug!("[PACIFICA_WS] Received: {}", text);
+        // Wait for response with matching ID (with timeout to prevent indefinite hang)
+        let ws_timeout = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async {
+                while let Some(msg) = read.next().await {
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            debug!("[PACIFICA_WS] Received: {}", text);
 
-                    // Try to parse as success response
-                    if let Ok(response) = serde_json::from_str::<WsCancelAllOrdersResponse>(&text)
-                    {
-                        if response.id == request_id {
-                            if response.code == 200 {
-                                info!(
-                                    "[PACIFICA_WS] Successfully cancelled {} order(s)",
-                                    response.data.cancelled_count
-                                );
-                                return Ok(response.data.cancelled_count);
-                            } else {
-                                anyhow::bail!(
-                                    "Cancel all orders failed with code: {}",
-                                    response.code
-                                );
+                            // Try to parse as success response
+                            if let Ok(response) = serde_json::from_str::<WsCancelAllOrdersResponse>(&text)
+                            {
+                                if response.id == request_id {
+                                    if response.code == 200 {
+                                        info!(
+                                            "[PACIFICA_WS] Successfully cancelled {} order(s)",
+                                            response.data.cancelled_count
+                                        );
+                                        return Ok(response.data.cancelled_count);
+                                    } else {
+                                        anyhow::bail!(
+                                            "Cancel all orders failed with code: {}",
+                                            response.code
+                                        );
+                                    }
+                                }
                             }
-                        }
-                    }
 
-                    // Try to parse as error response
-                    if let Ok(error_response) = serde_json::from_str::<WsErrorResponse>(&text) {
-                        if error_response.id == request_id {
-                            let error_msg = error_response
-                                .error
-                                .unwrap_or_else(|| format!("Unknown error (code: {})", error_response.code));
-                            anyhow::bail!("WebSocket error: {}", error_msg);
-                        }
-                    }
+                            // Try to parse as error response
+                            if let Ok(error_response) = serde_json::from_str::<WsErrorResponse>(&text) {
+                                if error_response.id == request_id {
+                                    let error_msg = error_response
+                                        .error
+                                        .unwrap_or_else(|| format!("Unknown error (code: {})", error_response.code));
+                                    anyhow::bail!("WebSocket error: {}", error_msg);
+                                }
+                            }
 
-                    // Ignore messages with different IDs (might be from other subscriptions)
+                            // Ignore messages with different IDs (might be from other subscriptions)
+                        }
+                        Ok(Message::Close(_)) => {
+                            anyhow::bail!("WebSocket closed before receiving response");
+                        }
+                        Err(e) => {
+                            anyhow::bail!("WebSocket error: {}", e);
+                        }
+                        _ => {}
+                    }
                 }
-                Ok(Message::Close(_)) => {
-                    anyhow::bail!("WebSocket closed before receiving response");
-                }
-                Err(e) => {
-                    anyhow::bail!("WebSocket error: {}", e);
-                }
-                _ => {}
+
+                anyhow::bail!("WebSocket stream ended before receiving response")
             }
-        }
+        ).await;
 
-        anyhow::bail!("WebSocket stream ended before receiving response")
+        match ws_timeout {
+            Ok(result) => result,
+            Err(_) => anyhow::bail!("WebSocket cancel_all_orders timed out after 10 seconds"),
+        }
     }
 
     /// Sign a message using Ed25519
