@@ -445,6 +445,16 @@ impl Config {
             order_notional_usd: self.order_notional_usd,
             profit_cancel_threshold_bps: self.profit_cancel_threshold_bps,
             order_refresh_interval_secs: self.order_refresh_interval_secs,
+            entry_z_score: 0.0,
+            spread_window_secs: default_spread_window_secs(),
+            max_position_units: default_max_position_units(),
+            max_loss_bps: default_max_loss_bps(),
+            max_hold_hours: default_max_hold_hours(),
+            close_spread_bps: 0.0,
+            funding_poll_interval_secs: default_funding_poll_interval_secs(),
+            funding_adverse_consecutive: default_funding_adverse_consecutive(),
+            funding_adverse_threshold_bps: default_funding_adverse_threshold_bps(),
+            close_limit_timeout_secs: default_close_limit_timeout_secs(),
         })
     }
 
@@ -459,6 +469,16 @@ impl Config {
                 order_notional_usd: self.order_notional_usd,
                 profit_cancel_threshold_bps,
                 order_refresh_interval_secs,
+                entry_z_score: 0.0,
+                spread_window_secs: default_spread_window_secs(),
+                max_position_units: default_max_position_units(),
+                max_loss_bps: default_max_loss_bps(),
+                max_hold_hours: default_max_hold_hours(),
+                close_spread_bps: 0.0,
+                funding_poll_interval_secs: default_funding_poll_interval_secs(),
+                funding_adverse_consecutive: default_funding_adverse_consecutive(),
+                funding_adverse_threshold_bps: default_funding_adverse_threshold_bps(),
+                close_limit_timeout_secs: default_close_limit_timeout_secs(),
             }
         })
     }

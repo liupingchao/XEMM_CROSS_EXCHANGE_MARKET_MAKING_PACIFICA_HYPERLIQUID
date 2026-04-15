@@ -471,19 +471,6 @@ impl XemmBot {
         let maker_secs_to_settle;
 
         if matches!(self.maker_kind, MakerExchangeKind::Binance) {
-            if let Ok(idx) = self
-                .maker_exchange
-                .as_any()
-                .downcast_ref::<crate::connector::maker::BinanceMakerExchange>()
-                .ok_or_else(|| anyhow::anyhow!("not BinanceMakerExchange"))
-                .and_then(|bme| {
-                    // We need access to the inner BinanceTrading. For now, use a direct API call.
-                    Err(anyhow::anyhow!("downcast not available"))
-                })
-            {
-                let _ = idx; // unreachable
-            }
-            // Fallback: use a separate HTTP call since we can't easily downcast the trait
             let client = reqwest::Client::new();
             let url = format!(
                 "https://fapi.binance.com/fapi/v1/premiumIndex?symbol={}",
