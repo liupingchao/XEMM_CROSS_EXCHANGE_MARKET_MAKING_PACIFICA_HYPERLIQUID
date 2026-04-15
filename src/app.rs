@@ -1350,9 +1350,10 @@ impl XemmBot {
                     }
 
                     // --- Normal carry position management (regime-aware) ---
-                    const CARRY_MIN_HOLD_SECS: u64 = 300;
+                    // Min hold: 30 minutes for non-emergency.
+                    // Carry strategy needs time to accumulate funding income.
+                    const CARRY_MIN_HOLD_SECS: u64 = 1800;
                     if !regime_decision.event_active {
-                        // Evaluate current regime (direction-agnostic)
                         let carry_regime = funding_tracker.evaluate_regime(
                             mid_spread_bps,
                             self.normal_mode.min_entry_spread_bps,
@@ -1365,15 +1366,13 @@ impl XemmBot {
                                 let hold_secs = pos.entry_time.elapsed().as_secs();
                                 let funding_jumped = funding_tracker.hedge_rate_jumped(0.0005);
 
-                                // Spread loss: how far has spread moved against our entry
-                                // For ShortMakerLongHedge: entry was positive, loss if spread shrinks past 0 or flips
-                                // For LongMakerShortHedge: entry was negative, loss if spread grows past 0 or flips
                                 let spread_loss = match pos.direction {
                                     CarryDirection::ShortMakerLongHedge => pos.entry_spread_bps - mid_spread_bps,
                                     CarryDirection::LongMakerShortHedge => mid_spread_bps - pos.entry_spread_bps,
                                 };
                                 let stop_loss = spread_loss > self.normal_mode.max_loss_bps;
 
+                                // Only emergency exits before min hold time
                                 if hold_secs < CARRY_MIN_HOLD_SECS && !funding_jumped && !stop_loss {
                                     None
                                 } else {
@@ -1381,14 +1380,22 @@ impl XemmBot {
                                     let carry_adverse = funding_tracker.consecutive_adverse(
                                         self.normal_mode.funding_adverse_threshold_bps as f64,
                                     ) >= self.normal_mode.funding_adverse_consecutive as usize;
-                                    let spread_converged = self.normal_mode.close_spread_bps > 0.0
-                                        && abs_mid_spread_bps < self.normal_mode.close_spread_bps;
+
+                                    // Spread converged: compare to ENTRY spread, not absolute threshold.
+                                    // Close when spread has reverted > 70% of the way from entry toward 0.
+                                    // E.g. entry at 10bps, close when |spread| < 10 * 0.3 = 3bps
+                                    // This is relative, so it works for any entry level.
+                                    let spread_converged = if self.normal_mode.close_spread_bps > 0.0 {
+                                        abs_mid_spread_bps < self.normal_mode.close_spread_bps
+                                    } else {
+                                        let entry_abs = pos.entry_spread_bps.abs();
+                                        entry_abs > 0.0 && abs_mid_spread_bps < entry_abs * 0.3
+                                    };
+
                                     let max_hold = self.normal_mode.max_hold_hours > 0
                                         && hold_hours >= self.normal_mode.max_hold_hours;
-                                    // Direction flipped: spread sign changed vs our position
                                     let direction_flipped = carry_regime.direction != pos.direction
                                         && hold_secs >= self.normal_mode.direction_flip_confirm_secs;
-                                    // Funding trend deteriorating
                                     let trend_adverse = self.normal_mode.funding_trend_adverse_count > 0
                                         && carry_regime.funding_trend < -1.0
                                         && funding_tracker.consecutive_adverse(0.0)
