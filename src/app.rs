@@ -519,9 +519,28 @@ impl XemmBot {
         abs_mid_spread_bps: f64,
     ) -> Result<bool> {
         let min_abs_pos = self.config.exit_rebalance_min_abs_position.max(0.0);
-        let (maker_pos, hedge_pos) = self
+        let (maker_pos, mut hedge_pos) = self
             .fetch_signed_positions(maker_symbol, hedge_symbol)
             .await?;
+
+        // If maker has a position but hedge shows 0, the hedge API may be lagging
+        // (e.g. after a hedge that completed < 1s ago). Retry with delays.
+        if maker_pos.abs() >= min_abs_pos && hedge_pos.abs() < min_abs_pos {
+            for retry in 1..=3 {
+                info!(
+                    "[EXIT] Hedge position=0 but maker={:.4} — retrying HL query ({}/3, wait 2s)",
+                    maker_pos, retry
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if let Ok((_, hp)) = self.fetch_signed_positions(maker_symbol, hedge_symbol).await {
+                    hedge_pos = hp;
+                    if hedge_pos.abs() >= min_abs_pos {
+                        info!("[EXIT] HL position found on retry: {:.4}", hedge_pos);
+                        break;
+                    }
+                }
+            }
+        }
 
         if maker_pos.abs() < min_abs_pos && hedge_pos.abs() < min_abs_pos {
             info!(
@@ -1111,33 +1130,44 @@ impl XemmBot {
                     }
 
                     // --- Normal carry position management ---
-                    // Check if we should close an existing carry position
+                    // Check if we should close an existing carry position.
+                    // Minimum hold: 5 minutes to let HL position propagate and collect carry.
+                    const CARRY_MIN_HOLD_SECS: u64 = 300;
                     if !regime_decision.event_active {
                         let should_close = {
                             let state = self.bot_state.read().await;
                             if let Some(ref pos) = state.normal_position {
-                                let spread_loss = pos.entry_spread_bps - mid_spread_bps;
-                                let hold_hours = pos.entry_time.elapsed().as_secs() / 3600;
-                                let carry_adverse = funding_tracker.consecutive_adverse(
-                                    self.normal_mode.funding_adverse_threshold_bps as f64,
-                                ) >= self.normal_mode.funding_adverse_consecutive as usize;
-                                let spread_narrowed = abs_mid_spread_bps < self.normal_mode.close_spread_bps;
-                                let stop_loss = spread_loss > self.normal_mode.max_loss_bps;
-                                let max_hold = hold_hours >= self.normal_mode.max_hold_hours;
-                                let funding_jumped = funding_tracker.hedge_rate_jumped(0.0005);
+                                let hold_secs = pos.entry_time.elapsed().as_secs();
 
-                                if funding_jumped {
-                                    Some("funding_rate_jump")
-                                } else if stop_loss {
-                                    Some("stop_loss")
-                                } else if carry_adverse {
-                                    Some("carry_adverse")
-                                } else if spread_narrowed {
-                                    Some("spread_narrowed")
-                                } else if max_hold {
-                                    Some("max_hold_time")
+                                // Never close before minimum hold time (except emergency)
+                                let funding_jumped = funding_tracker.hedge_rate_jumped(0.0005);
+                                let stop_loss = (pos.entry_spread_bps - mid_spread_bps) > self.normal_mode.max_loss_bps;
+
+                                if hold_secs < CARRY_MIN_HOLD_SECS && !funding_jumped && !stop_loss {
+                                    None // Too early, keep holding
                                 } else {
-                                    None
+                                    let hold_hours = hold_secs / 3600;
+                                    let carry_adverse = funding_tracker.consecutive_adverse(
+                                        self.normal_mode.funding_adverse_threshold_bps as f64,
+                                    ) >= self.normal_mode.funding_adverse_consecutive as usize;
+                                    let spread_narrowed = self.normal_mode.close_spread_bps > 0.0
+                                        && abs_mid_spread_bps < self.normal_mode.close_spread_bps;
+                                    let max_hold = self.normal_mode.max_hold_hours > 0
+                                        && hold_hours >= self.normal_mode.max_hold_hours;
+
+                                    if funding_jumped {
+                                        Some("funding_rate_jump")
+                                    } else if stop_loss {
+                                        Some("stop_loss")
+                                    } else if carry_adverse {
+                                        Some("carry_adverse")
+                                    } else if spread_narrowed {
+                                        Some("spread_narrowed")
+                                    } else if max_hold {
+                                        Some("max_hold_time")
+                                    } else {
+                                        None
+                                    }
                                 }
                             } else {
                                 None
