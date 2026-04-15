@@ -1235,22 +1235,46 @@ impl XemmBot {
 
                     let best_opp = OpportunityEvaluator::pick_best_opportunity(buy_opp, sell_opp, pac_mid);
 
-                    // Normal mode: gate entry on Z-score and max position
+                    // Normal mode: strict entry gating for carry strategy
                     if best_opp.is_some() && matches!(regime_decision.profile, EntryProfile::Normal) {
+                        // 1. Only SELL on maker (SHORT BN + LONG HL = carry direction).
+                        //    BUY would create the opposite position with adverse carry.
+                        if let Some(ref opp) = best_opp {
+                            if opp.direction == OrderSide::Buy {
+                                // Skip BUY — carry strategy only opens SHORT maker
+                                continue;
+                            }
+                        }
+
+                        // 2. Spread must be positive (BN > HL) and above minimum
+                        if mid_spread_bps < 8.0 {
+                            continue;
+                        }
+
+                        // 3. Z-score gate (if enabled)
                         let z = spread_stats.z_score(mid_spread_bps);
-                        let current_pos = {
-                            let state = self.bot_state.read().await;
-                            state.normal_position.as_ref().map(|p| p.size).unwrap_or(0.0)
-                        };
                         if self.normal_mode.entry_z_score > 0.0
                             && (z < self.normal_mode.entry_z_score
                                 || !spread_stats.is_ready(60))
                         {
-                            // Spread not spiked enough — skip entry, wait for better price
                             continue;
                         }
+
+                        // 4. Max position limit
+                        let current_pos = {
+                            let state = self.bot_state.read().await;
+                            state.normal_position.as_ref().map(|p| p.size).unwrap_or(0.0)
+                        };
                         if current_pos >= self.normal_mode.max_position_units {
-                            // Already at max carry position — don't add more
+                            continue;
+                        }
+
+                        // 5. Don't open if funding carry is adverse
+                        if funding_tracker.has_data()
+                            && funding_tracker.current_carry_bps() < 0.0
+                        {
+                            debug!("[CARRY] Skipping entry: net carry is negative ({:.1} bps/8h)",
+                                funding_tracker.current_carry_bps());
                             continue;
                         }
                     }
