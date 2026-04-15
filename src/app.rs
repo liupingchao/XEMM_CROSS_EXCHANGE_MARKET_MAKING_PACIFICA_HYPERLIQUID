@@ -508,6 +508,72 @@ impl XemmBot {
         })
     }
 
+    /// Close a specific size of position in a given direction.
+    /// Used for partial closes (event-only or carry-only) without touching the other side.
+    async fn close_partial_position(
+        &self,
+        maker_symbol: &str,
+        hedge_symbol: &str,
+        size: f64,
+        direction: CarryDirection,
+        pac_bid: f64,
+        pac_ask: f64,
+        hl_bid: f64,
+        hl_ask: f64,
+    ) -> anyhow::Result<()> {
+        if size < self.config.exit_rebalance_min_abs_position {
+            return Ok(());
+        }
+
+        // Determine order sides based on direction
+        let (maker_side, hl_is_buy) = match direction {
+            CarryDirection::ShortMakerLongHedge => {
+                // We are SHORT maker + LONG hedge → close by BUY maker + SELL hedge
+                (MakerOrderSide::Buy, false)
+            }
+            CarryDirection::LongMakerShortHedge => {
+                // We are LONG maker + SHORT hedge → close by SELL maker + BUY hedge
+                (MakerOrderSide::Sell, true)
+            }
+        };
+
+        info!(
+            "[PARTIAL_CLOSE] Closing {:.4} units {:?} | maker {} + hedge {}",
+            size,
+            direction,
+            maker_side.as_str(),
+            if hl_is_buy { "BUY" } else { "SELL" }
+        );
+
+        // Cancel existing maker orders first
+        if let Err(e) = self.maker_exchange.cancel_all_orders(Some(maker_symbol)).await {
+            warn!("[PARTIAL_CLOSE] Failed to cancel maker orders: {}", e);
+        }
+
+        // Close maker side
+        self.maker_exchange
+            .place_market_order(maker_symbol, maker_side, size, true)
+            .await
+            .with_context(|| format!("Failed maker partial close ({} {})", maker_side.as_str(), size))?;
+
+        // Close hedge side
+        self.hyperliquid_trading
+            .place_market_order(
+                hedge_symbol,
+                hl_is_buy,
+                size,
+                self.config.hyperliquid_slippage,
+                true, // reduce_only
+                Some(hl_bid),
+                Some(hl_ask),
+            )
+            .await
+            .with_context(|| format!("Failed hedge partial close ({} {})", if hl_is_buy { "BUY" } else { "SELL" }, size))?;
+
+        info!("[PARTIAL_CLOSE] Successfully closed {:.4} units", size);
+        Ok(())
+    }
+
     async fn trigger_exit_rebalance(
         &self,
         maker_symbol: &str,
@@ -1044,26 +1110,31 @@ impl XemmBot {
                                     >= Duration::from_secs(self.config.exit_rebalance_confirm_secs)
                                 {
                                     if Instant::now() >= next_exit_rebalance_allowed_at {
-                                        match self
-                                            .trigger_exit_rebalance(
-                                                &maker_symbol,
-                                                &hedge_symbol,
-                                                pac_bid,
-                                                pac_ask,
-                                                hl_bid,
-                                                hl_ask,
-                                                abs_mid_spread_bps,
-                                            )
-                                            .await
-                                        {
-                                            Ok(triggered) => {
-                                                if triggered {
+                                        // Close only event position, preserve normal carry
+                                        let event_close_result = {
+                                            let state = self.bot_state.read().await;
+                                            state.event_position.clone()
+                                        };
+                                        let close_result = if let Some(ref ep) = event_close_result {
+                                            self.close_partial_position(
+                                                &maker_symbol, &hedge_symbol,
+                                                ep.size, ep.direction,
+                                                pac_bid, pac_ask, hl_bid, hl_ask,
+                                            ).await
+                                        } else {
+                                            Ok(()) // No event position to close
+                                        };
+                                        match close_result {
+                                            Ok(()) => {
+                                                if event_close_result.is_some() {
+                                                    let mut state = self.bot_state.write().await;
+                                                    state.event_position = None;
                                                     info!(
-                                                        "[EXIT] {} Event spread flattened and rebalanced",
+                                                        "[EXIT] {} Event position closed (normal carry preserved)",
                                                         "✓".green().bold()
                                                     );
                                                 } else {
-                                                    info!("[EXIT] Event ended without residual position");
+                                                    info!("[EXIT] Event ended without event position");
                                                 }
                                                 regime.clear_event_with_cooldown(
                                                     self.config.event_rearm_cooldown_secs,
@@ -1199,22 +1270,42 @@ impl XemmBot {
 
                         if let Some(reason) = should_close {
                             let use_market = matches!(reason, "funding_rate_jump" | "stop_loss");
+                            let close_size_and_dir = {
+                                let state = self.bot_state.read().await;
+                                state.normal_position.as_ref().map(|p| (p.size, p.direction))
+                            };
                             info!(
                                 "[CARRY] Closing position: {} (market={}) | regime: dir={:?} carry={:.1}bps trend={:.1}",
                                 reason, use_market, carry_regime.direction,
                                 carry_regime.net_carry_bps, carry_regime.funding_trend
                             );
-                            match self
-                                .trigger_exit_rebalance(
+                            let close_result = if use_market {
+                                // Emergency: full flatten via trigger_exit_rebalance
+                                self.trigger_exit_rebalance(
                                     &maker_symbol, &hedge_symbol,
                                     pac_bid, pac_ask, hl_bid, hl_ask,
                                     abs_mid_spread_bps,
-                                )
-                                .await
-                            {
-                                Ok(_) => {
+                                ).await.map(|_| ())
+                            } else if let Some((size, dir)) = close_size_and_dir {
+                                // Normal close: only close carry portion
+                                self.close_partial_position(
+                                    &maker_symbol, &hedge_symbol,
+                                    size, dir,
+                                    pac_bid, pac_ask, hl_bid, hl_ask,
+                                ).await
+                            } else {
+                                Ok(())
+                            };
+                            match close_result {
+                                Ok(()) => {
                                     let mut state = self.bot_state.write().await;
-                                    state.normal_position = None;
+                                    if use_market {
+                                        // Emergency flatten clears everything
+                                        state.normal_position = None;
+                                        state.event_position = None;
+                                    } else {
+                                        state.normal_position = None;
+                                    }
                                     funding_tracker.clear_direction();
                                     info!("[CARRY] Position closed successfully");
                                 }
@@ -1474,6 +1565,34 @@ impl XemmBot {
                                             state.normal_position.as_ref().map(|p| p.size).unwrap_or(0.0),
                                             prev_size,
                                             state.normal_position.as_ref().map(|p| p.entry_spread_bps).unwrap_or(0.0)
+                                        );
+                                    }
+
+                                    // Track event position separately
+                                    if matches!(regime_decision.profile, EntryProfile::Event) {
+                                        let carry_dir = if mid_spread_bps >= 0.0 {
+                                            CarryDirection::ShortMakerLongHedge
+                                        } else {
+                                            CarryDirection::LongMakerShortHedge
+                                        };
+                                        let prev_size = state.event_position.as_ref().map(|p| p.size).unwrap_or(0.0);
+                                        if state.event_position.is_none() {
+                                            state.event_position = Some(crate::bot::EventPosition {
+                                                direction: carry_dir,
+                                                entry_spread_bps: mid_spread_bps,
+                                                entry_time: placed_at,
+                                                size: opp.size,
+                                            });
+                                        } else if let Some(ref mut ep) = state.event_position {
+                                            let total = ep.size + opp.size;
+                                            ep.entry_spread_bps = (ep.entry_spread_bps * ep.size + mid_spread_bps * opp.size) / total;
+                                            ep.size = total;
+                                        }
+                                        info!("[EVENT] Position {:?}: {:.4} units (was {:.4}), entry_spread={:.1} bps",
+                                            carry_dir,
+                                            state.event_position.as_ref().map(|p| p.size).unwrap_or(0.0),
+                                            prev_size,
+                                            state.event_position.as_ref().map(|p| p.entry_spread_bps).unwrap_or(0.0)
                                         );
                                     }
                                 } else {

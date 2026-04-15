@@ -79,6 +79,15 @@ pub struct NormalModePosition {
     pub size: f64,
 }
 
+/// Event-mode position tracking (separate from normal carry).
+#[derive(Debug, Clone)]
+pub struct EventPosition {
+    pub direction: crate::strategy::funding::CarryDirection,
+    pub entry_spread_bps: f64,
+    pub entry_time: Instant,
+    pub size: f64,
+}
+
 /// Bot state (thread-safe via Arc<RwLock<BotState>>)
 #[derive(Debug)]
 pub struct BotState {
@@ -96,6 +105,8 @@ pub struct BotState {
     pub last_cancellation_time: Option<Instant>,
     /// Normal-mode carry position (Some when holding a carry position).
     pub normal_position: Option<NormalModePosition>,
+    /// Event-mode position (tracked separately, flattened when event ends).
+    pub event_position: Option<EventPosition>,
 }
 
 impl BotState {
@@ -109,6 +120,7 @@ impl BotState {
             status_atomic: Arc::new(AtomicU8::new(0)), // 0 = Idle
             last_cancellation_time: None,
             normal_position: None,
+            event_position: None,
         }
     }
 
