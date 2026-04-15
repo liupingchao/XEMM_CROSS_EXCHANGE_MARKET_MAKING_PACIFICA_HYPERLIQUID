@@ -69,11 +69,13 @@ impl PendingOrder {
 /// Normal-mode carry position tracking.
 #[derive(Debug, Clone)]
 pub struct NormalModePosition {
+    /// Direction of the carry position.
+    pub direction: crate::strategy::funding::CarryDirection,
     /// Mid spread in bps when the position was opened.
     pub entry_spread_bps: f64,
     /// When the position was opened.
     pub entry_time: Instant,
-    /// Accumulated size (positive = short maker + long hedge).
+    /// Accumulated size in base units (always positive).
     pub size: f64,
 }
 

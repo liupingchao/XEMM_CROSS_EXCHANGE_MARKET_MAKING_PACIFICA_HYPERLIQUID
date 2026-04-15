@@ -33,7 +33,7 @@ use crate::services::{
     HedgeEvent,
 };
 use crate::strategy::{EntryProfile, OpportunityEvaluator, OrderSide, RegimeController, RegimeSettings};
-use crate::strategy::funding::{FundingCarryTracker, FundingSnapshot};
+use crate::strategy::funding::{CarryDirection, FundingCarryTracker, FundingSnapshot};
 use crate::strategy::spread_stats::SpreadStats;
 use crate::util::api_health::BinanceApiHealth;
 use crate::util::rate_limit::{is_rate_limit_error, parse_ban_until_ms, RateLimitTracker};
@@ -1129,40 +1129,63 @@ impl XemmBot {
                         }
                     }
 
-                    // --- Normal carry position management ---
-                    // Check if we should close an existing carry position.
-                    // Minimum hold: 5 minutes to let HL position propagate and collect carry.
+                    // --- Normal carry position management (regime-aware) ---
                     const CARRY_MIN_HOLD_SECS: u64 = 300;
                     if !regime_decision.event_active {
+                        // Evaluate current regime (direction-agnostic)
+                        let carry_regime = funding_tracker.evaluate_regime(
+                            mid_spread_bps,
+                            self.normal_mode.min_entry_spread_bps,
+                            self.normal_mode.min_carry_bps,
+                        );
+
                         let should_close = {
                             let state = self.bot_state.read().await;
                             if let Some(ref pos) = state.normal_position {
                                 let hold_secs = pos.entry_time.elapsed().as_secs();
-
-                                // Never close before minimum hold time (except emergency)
                                 let funding_jumped = funding_tracker.hedge_rate_jumped(0.0005);
-                                let stop_loss = (pos.entry_spread_bps - mid_spread_bps) > self.normal_mode.max_loss_bps;
+
+                                // Spread loss: how far has spread moved against our entry
+                                // For ShortMakerLongHedge: entry was positive, loss if spread shrinks past 0 or flips
+                                // For LongMakerShortHedge: entry was negative, loss if spread grows past 0 or flips
+                                let spread_loss = match pos.direction {
+                                    CarryDirection::ShortMakerLongHedge => pos.entry_spread_bps - mid_spread_bps,
+                                    CarryDirection::LongMakerShortHedge => mid_spread_bps - pos.entry_spread_bps,
+                                };
+                                let stop_loss = spread_loss > self.normal_mode.max_loss_bps;
 
                                 if hold_secs < CARRY_MIN_HOLD_SECS && !funding_jumped && !stop_loss {
-                                    None // Too early, keep holding
+                                    None
                                 } else {
                                     let hold_hours = hold_secs / 3600;
                                     let carry_adverse = funding_tracker.consecutive_adverse(
                                         self.normal_mode.funding_adverse_threshold_bps as f64,
                                     ) >= self.normal_mode.funding_adverse_consecutive as usize;
-                                    let spread_narrowed = self.normal_mode.close_spread_bps > 0.0
+                                    let spread_converged = self.normal_mode.close_spread_bps > 0.0
                                         && abs_mid_spread_bps < self.normal_mode.close_spread_bps;
                                     let max_hold = self.normal_mode.max_hold_hours > 0
                                         && hold_hours >= self.normal_mode.max_hold_hours;
+                                    // Direction flipped: spread sign changed vs our position
+                                    let direction_flipped = carry_regime.direction != pos.direction
+                                        && hold_secs >= self.normal_mode.direction_flip_confirm_secs;
+                                    // Funding trend deteriorating
+                                    let trend_adverse = self.normal_mode.funding_trend_adverse_count > 0
+                                        && carry_regime.funding_trend < -1.0
+                                        && funding_tracker.consecutive_adverse(0.0)
+                                            >= self.normal_mode.funding_trend_adverse_count as usize;
 
                                     if funding_jumped {
                                         Some("funding_rate_jump")
                                     } else if stop_loss {
                                         Some("stop_loss")
+                                    } else if direction_flipped {
+                                        Some("direction_flipped")
+                                    } else if trend_adverse {
+                                        Some("funding_trend_adverse")
                                     } else if carry_adverse {
                                         Some("carry_adverse")
-                                    } else if spread_narrowed {
-                                        Some("spread_narrowed")
+                                    } else if spread_converged {
+                                        Some("spread_converged")
                                     } else if max_hold {
                                         Some("max_hold_time")
                                     } else {
@@ -1177,8 +1200,9 @@ impl XemmBot {
                         if let Some(reason) = should_close {
                             let use_market = matches!(reason, "funding_rate_jump" | "stop_loss");
                             info!(
-                                "[CARRY] Closing normal position: {} (market={})",
-                                reason, use_market
+                                "[CARRY] Closing position: {} (market={}) | regime: dir={:?} carry={:.1}bps trend={:.1}",
+                                reason, use_market, carry_regime.direction,
+                                carry_regime.net_carry_bps, carry_regime.funding_trend
                             );
                             match self
                                 .trigger_exit_rebalance(
@@ -1191,6 +1215,7 @@ impl XemmBot {
                                 Ok(_) => {
                                     let mut state = self.bot_state.write().await;
                                     state.normal_position = None;
+                                    funding_tracker.clear_direction();
                                     info!("[CARRY] Position closed successfully");
                                 }
                                 Err(e) => {
@@ -1235,23 +1260,41 @@ impl XemmBot {
 
                     let best_opp = OpportunityEvaluator::pick_best_opportunity(buy_opp, sell_opp, pac_mid);
 
-                    // Normal mode: strict entry gating for carry strategy
+                    // Normal mode: direction-agnostic regime-aware entry gating
                     if best_opp.is_some() && matches!(regime_decision.profile, EntryProfile::Normal) {
-                        // 1. Only SELL on maker (SHORT BN + LONG HL = carry direction).
-                        //    BUY would create the opposite position with adverse carry.
+                        let carry_regime = funding_tracker.evaluate_regime(
+                            mid_spread_bps,
+                            self.normal_mode.min_entry_spread_bps,
+                            self.normal_mode.min_carry_bps,
+                        );
+
+                        // 1. Regime must be favorable (spread large enough + carry positive)
+                        if !carry_regime.is_favorable {
+                            continue;
+                        }
+
+                        // 2. Order direction must match regime direction
+                        let required_side = match carry_regime.direction {
+                            CarryDirection::ShortMakerLongHedge => OrderSide::Sell,
+                            CarryDirection::LongMakerShortHedge => OrderSide::Buy,
+                        };
                         if let Some(ref opp) = best_opp {
-                            if opp.direction == OrderSide::Buy {
-                                // Skip BUY — carry strategy only opens SHORT maker
+                            if opp.direction != required_side {
                                 continue;
                             }
                         }
 
-                        // 2. Spread must be positive (BN > HL) and above minimum
-                        if mid_spread_bps < 8.0 {
-                            continue;
+                        // 3. If already positioned, direction must match
+                        {
+                            let state = self.bot_state.read().await;
+                            if let Some(ref pos) = state.normal_position {
+                                if pos.direction != carry_regime.direction {
+                                    continue; // Can't add to position in opposite direction
+                                }
+                            }
                         }
 
-                        // 3. Z-score gate (if enabled)
+                        // 4. Z-score gate (if enabled)
                         let z = spread_stats.z_score(mid_spread_bps);
                         if self.normal_mode.entry_z_score > 0.0
                             && (z < self.normal_mode.entry_z_score
@@ -1260,21 +1303,12 @@ impl XemmBot {
                             continue;
                         }
 
-                        // 4. Max position limit
+                        // 5. Max position limit
                         let current_pos = {
                             let state = self.bot_state.read().await;
                             state.normal_position.as_ref().map(|p| p.size).unwrap_or(0.0)
                         };
                         if current_pos >= self.normal_mode.max_position_units {
-                            continue;
-                        }
-
-                        // 5. Don't open if funding carry is adverse
-                        if funding_tracker.has_data()
-                            && funding_tracker.current_carry_bps() < 0.0
-                        {
-                            debug!("[CARRY] Skipping entry: net carry is negative ({:.1} bps/8h)",
-                                funding_tracker.current_carry_bps());
                             continue;
                         }
                     }
@@ -1414,22 +1448,29 @@ impl XemmBot {
                                         active_profile.order_refresh_interval_secs,
                                     );
 
-                                    // Track carry position in normal mode
+                                    // Track carry position in normal mode (direction-aware)
                                     if matches!(regime_decision.profile, EntryProfile::Normal) {
+                                        let carry_dir = if mid_spread_bps >= 0.0 {
+                                            CarryDirection::ShortMakerLongHedge
+                                        } else {
+                                            CarryDirection::LongMakerShortHedge
+                                        };
                                         let prev_size = state.normal_position.as_ref().map(|p| p.size).unwrap_or(0.0);
                                         if state.normal_position.is_none() {
                                             state.normal_position = Some(crate::bot::NormalModePosition {
+                                                direction: carry_dir,
                                                 entry_spread_bps: mid_spread_bps,
                                                 entry_time: placed_at,
                                                 size: opp.size,
                                             });
+                                            funding_tracker.set_positioned_direction(carry_dir);
                                         } else if let Some(ref mut pos) = state.normal_position {
-                                            // Add to existing position (weighted average entry spread)
                                             let total = pos.size + opp.size;
                                             pos.entry_spread_bps = (pos.entry_spread_bps * pos.size + mid_spread_bps * opp.size) / total;
                                             pos.size = total;
                                         }
-                                        info!("[CARRY] Position updated: {:.4} units (was {:.4}), entry_spread={:.1} bps",
+                                        info!("[CARRY] Position {:?}: {:.4} units (was {:.4}), entry_spread={:.1} bps",
+                                            carry_dir,
                                             state.normal_position.as_ref().map(|p| p.size).unwrap_or(0.0),
                                             prev_size,
                                             state.normal_position.as_ref().map(|p| p.entry_spread_bps).unwrap_or(0.0)

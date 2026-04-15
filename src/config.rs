@@ -54,6 +54,22 @@ pub struct ModeTradingConfig {
     /// Timeout for maker limit close order before fallback to taker.
     #[serde(default = "default_close_limit_timeout_secs")]
     pub close_limit_timeout_secs: u64,
+
+    /// Minimum |mid_spread| in bps to open a carry position.
+    #[serde(default = "default_min_entry_spread_bps")]
+    pub min_entry_spread_bps: f64,
+    /// Minimum net carry (bps/8h) to open. 0 = only require non-negative.
+    #[serde(default)]
+    pub min_carry_bps: f64,
+    /// Half-window size for funding trend calculation (in polling cycles).
+    #[serde(default = "default_funding_trend_window")]
+    pub funding_trend_window: u64,
+    /// Close when funding trend is adverse for this many consecutive polls.
+    #[serde(default = "default_funding_trend_adverse_count")]
+    pub funding_trend_adverse_count: u64,
+    /// Seconds to confirm a spread direction flip before closing.
+    #[serde(default = "default_direction_flip_confirm_secs")]
+    pub direction_flip_confirm_secs: u64,
 }
 
 impl ModeTradingConfig {
@@ -385,6 +401,18 @@ fn default_funding_adverse_threshold_bps() -> f64 {
 fn default_close_limit_timeout_secs() -> u64 {
     30
 }
+fn default_min_entry_spread_bps() -> f64 {
+    8.0
+}
+fn default_funding_trend_window() -> u64 {
+    6
+}
+fn default_funding_trend_adverse_count() -> u64 {
+    4
+}
+fn default_direction_flip_confirm_secs() -> u64 {
+    120
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -455,6 +483,11 @@ impl Config {
             funding_adverse_consecutive: default_funding_adverse_consecutive(),
             funding_adverse_threshold_bps: default_funding_adverse_threshold_bps(),
             close_limit_timeout_secs: default_close_limit_timeout_secs(),
+            min_entry_spread_bps: default_min_entry_spread_bps(),
+            min_carry_bps: 0.0,
+            funding_trend_window: default_funding_trend_window(),
+            funding_trend_adverse_count: default_funding_trend_adverse_count(),
+            direction_flip_confirm_secs: default_direction_flip_confirm_secs(),
         })
     }
 
@@ -479,6 +512,11 @@ impl Config {
                 funding_adverse_consecutive: default_funding_adverse_consecutive(),
                 funding_adverse_threshold_bps: default_funding_adverse_threshold_bps(),
                 close_limit_timeout_secs: default_close_limit_timeout_secs(),
+                min_entry_spread_bps: default_min_entry_spread_bps(),
+                min_carry_bps: 0.0,
+                funding_trend_window: default_funding_trend_window(),
+                funding_trend_adverse_count: default_funding_trend_adverse_count(),
+                direction_flip_confirm_secs: default_direction_flip_confirm_secs(),
             }
         })
     }
