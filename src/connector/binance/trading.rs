@@ -524,4 +524,35 @@ impl BinanceTrading {
             })
             .collect())
     }
+
+    /// Fetch current funding rate and next settlement time.
+    pub async fn get_premium_index(&self, symbol: &str) -> Result<BinancePremiumIndex> {
+        let url = format!(
+            "{}/fapi/v1/premiumIndex?symbol={}",
+            self.rest_url, symbol
+        );
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch premiumIndex")?;
+        let text = response.text().await?;
+        serde_json::from_str(&text)
+            .with_context(|| format!("Failed to parse premiumIndex: {}", &text[..text.len().min(200)]))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BinancePremiumIndex {
+    pub symbol: String,
+    /// Current funding rate (per-8h, signed). Negative = shorts pay longs.
+    #[serde(rename = "lastFundingRate")]
+    pub last_funding_rate: String,
+    /// Next funding settlement timestamp (epoch millis).
+    #[serde(rename = "nextFundingTime")]
+    pub next_funding_time: u64,
+    /// Current mark price.
+    #[serde(rename = "markPrice")]
+    pub mark_price: String,
 }

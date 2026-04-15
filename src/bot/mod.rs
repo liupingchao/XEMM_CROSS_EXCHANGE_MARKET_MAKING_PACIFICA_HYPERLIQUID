@@ -1,3 +1,3 @@
 pub mod state;
 
-pub use state::{ActiveOrder, BotState, BotStatus, PendingOrder};
+pub use state::{ActiveOrder, BotState, BotStatus, NormalModePosition, PendingOrder};

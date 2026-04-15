@@ -21,6 +21,39 @@ pub struct ModeTradingConfig {
     pub profit_cancel_threshold_bps: f64,
     /// Order refresh interval in seconds
     pub order_refresh_interval_secs: u64,
+
+    // --- Carry-mode fields (normal mode only, ignored in event mode) ---
+
+    /// Z-score threshold for entry (open position when spread spikes).
+    #[serde(default)]
+    pub entry_z_score: f64,
+    /// Rolling spread window in seconds for Z-score calculation.
+    #[serde(default = "default_spread_window_secs")]
+    pub spread_window_secs: u64,
+    /// Max accumulated position in base units.
+    #[serde(default = "default_max_position_units")]
+    pub max_position_units: f64,
+    /// Stop-loss: close if spread moves against entry by this many bps.
+    #[serde(default = "default_max_loss_bps")]
+    pub max_loss_bps: f64,
+    /// Max holding time in hours before forced close.
+    #[serde(default = "default_max_hold_hours")]
+    pub max_hold_hours: u64,
+    /// Close position when spread narrows below this (low-cost exit window).
+    #[serde(default)]
+    pub close_spread_bps: f64,
+    /// Funding rate poll interval in seconds.
+    #[serde(default = "default_funding_poll_interval_secs")]
+    pub funding_poll_interval_secs: u64,
+    /// Number of consecutive adverse carry observations before closing.
+    #[serde(default = "default_funding_adverse_consecutive")]
+    pub funding_adverse_consecutive: u64,
+    /// Threshold bps below which carry is considered adverse.
+    #[serde(default = "default_funding_adverse_threshold_bps")]
+    pub funding_adverse_threshold_bps: f64,
+    /// Timeout for maker limit close order before fallback to taker.
+    #[serde(default = "default_close_limit_timeout_secs")]
+    pub close_limit_timeout_secs: u64,
 }
 
 impl ModeTradingConfig {
@@ -324,6 +357,33 @@ fn default_pacifica_rest_poll_interval() -> u64 {
 
 fn default_pacifica_active_order_rest_poll_interval() -> u64 {
     500 // 500 ms (safer than 100ms to avoid rate limits)
+}
+
+// --- Carry-mode defaults (for ModeTradingConfig) ---
+
+fn default_spread_window_secs() -> u64 {
+    1800 // 30 minutes
+}
+fn default_max_position_units() -> f64 {
+    10.0
+}
+fn default_max_loss_bps() -> f64 {
+    50.0
+}
+fn default_max_hold_hours() -> u64 {
+    168 // 1 week
+}
+fn default_funding_poll_interval_secs() -> u64 {
+    60
+}
+fn default_funding_adverse_consecutive() -> u64 {
+    3
+}
+fn default_funding_adverse_threshold_bps() -> f64 {
+    -2.0
+}
+fn default_close_limit_timeout_secs() -> u64 {
+    30
 }
 
 impl Default for Config {

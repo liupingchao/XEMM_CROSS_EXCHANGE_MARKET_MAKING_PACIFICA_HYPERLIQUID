@@ -660,4 +660,44 @@ impl HyperliquidTrading {
     pub fn get_wallet_address(&self) -> String {
         format!("{:?}", self.wallet.address())
     }
+
+    /// Fetch recent funding rate history for a coin.
+    /// Returns the most recent entry (hourly for perps on HL).
+    pub async fn get_latest_funding_rate(&self, coin: &str) -> Result<Option<HlFundingEntry>> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as u64;
+        // Look back 2 hours to ensure we get at least 1 entry
+        let start_ms = now_ms.saturating_sub(2 * 3600 * 1000);
+
+        let payload = serde_json::json!({
+            "type": "fundingHistory",
+            "coin": coin,
+            "startTime": start_ms
+        });
+
+        let response = self
+            .client
+            .post(&self.info_url)
+            .json(&payload)
+            .send()
+            .await
+            .context("Failed to fetch HL fundingHistory")?;
+
+        let text = response.text().await?;
+        let entries: Vec<HlFundingEntry> = serde_json::from_str(&text)
+            .with_context(|| format!("Failed to parse HL fundingHistory: {}", &text[..text.len().min(200)]))?;
+
+        Ok(entries.last().cloned())
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct HlFundingEntry {
+    pub coin: String,
+    /// Epoch millis of this funding settlement.
+    pub time: u64,
+    /// Funding rate for this period (hourly, signed).
+    #[serde(rename = "fundingRate")]
+    pub funding_rate: String,
 }

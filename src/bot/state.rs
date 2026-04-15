@@ -66,6 +66,17 @@ impl PendingOrder {
     }
 }
 
+/// Normal-mode carry position tracking.
+#[derive(Debug, Clone)]
+pub struct NormalModePosition {
+    /// Mid spread in bps when the position was opened.
+    pub entry_spread_bps: f64,
+    /// When the position was opened.
+    pub entry_time: Instant,
+    /// Accumulated size (positive = short maker + long hedge).
+    pub size: f64,
+}
+
 /// Bot state (thread-safe via Arc<RwLock<BotState>>)
 #[derive(Debug)]
 pub struct BotState {
@@ -81,6 +92,8 @@ pub struct BotState {
     pub status_atomic: Arc<AtomicU8>,
     /// Last time an order was cancelled (for grace period enforcement)
     pub last_cancellation_time: Option<Instant>,
+    /// Normal-mode carry position (Some when holding a carry position).
+    pub normal_position: Option<NormalModePosition>,
 }
 
 impl BotState {
@@ -93,6 +106,7 @@ impl BotState {
             status: BotStatus::Idle,
             status_atomic: Arc::new(AtomicU8::new(0)), // 0 = Idle
             last_cancellation_time: None,
+            normal_position: None,
         }
     }
 
