@@ -339,6 +339,98 @@ impl XemmBot {
             ),
         }
 
+        // Flatten any residual positions from previous runs
+        info!("{} Checking for residual positions...",
+            "[INIT]".cyan().bold()
+        );
+        {
+            let maker_positions = maker_exchange.get_positions(Some(&maker_symbol)).await;
+            let hl_user_state = hyperliquid_trading
+                .get_user_state(&hl_wallet)
+                .await;
+
+            let maker_pos = maker_positions
+                .as_ref()
+                .ok()
+                .and_then(|ps| ps.first())
+                .map(|p| p.signed_amount())
+                .unwrap_or(0.0);
+
+            let hedge_pos = hl_user_state
+                .as_ref()
+                .ok()
+                .and_then(|us| {
+                    us.asset_positions
+                        .iter()
+                        .find(|ap| ap.position.coin == hedge_symbol)
+                })
+                .and_then(|ap| ap.position.szi.parse::<f64>().ok())
+                .unwrap_or(0.0);
+
+            let min_pos = 0.01_f64;
+            if maker_pos.abs() >= min_pos || hedge_pos.abs() >= min_pos {
+                warn!(
+                    "{} {} Residual positions found: maker={:.4}, hedge={:.4} — flattening",
+                    "[INIT]".cyan().bold(),
+                    "⚠".yellow().bold(),
+                    maker_pos,
+                    hedge_pos
+                );
+
+                if maker_pos.abs() >= min_pos {
+                    let side = if maker_pos > 0.0 { MakerOrderSide::Sell } else { MakerOrderSide::Buy };
+                    match maker_exchange.place_market_order(&maker_symbol, side, maker_pos.abs(), true).await {
+                        Ok(_) => info!("{} {} Maker residual flattened ({} {:.4})",
+                            "[INIT]".cyan().bold(), "✓".green().bold(), side.as_str(), maker_pos.abs()),
+                        Err(e) => warn!("{} {} Failed to flatten maker: {}",
+                            "[INIT]".cyan().bold(), "⚠".yellow().bold(), e),
+                    }
+                }
+
+                if hedge_pos.abs() >= min_pos {
+                    let hl_is_buy = hedge_pos < 0.0;
+                    // Get a price estimate for slippage calc
+                    let hl_snap = hyperliquid_trading.get_l2_snapshot(&hedge_symbol).await.ok().flatten();
+                    let (bid, ask) = hl_snap.unwrap_or((0.0, 0.0));
+                    if bid > 0.0 && ask > 0.0 {
+                        match hyperliquid_trading.place_market_order(
+                            &hedge_symbol, hl_is_buy, hedge_pos.abs(),
+                            config.hyperliquid_slippage, true, Some(bid), Some(ask),
+                        ).await {
+                            Ok(_) => info!("{} {} Hedge residual flattened ({} {:.4})",
+                                "[INIT]".cyan().bold(), "✓".green().bold(),
+                                if hl_is_buy { "BUY" } else { "SELL" }, hedge_pos.abs()),
+                            Err(e) => warn!("{} {} Failed to flatten hedge: {}",
+                                "[INIT]".cyan().bold(), "⚠".yellow().bold(), e),
+                        }
+                    } else {
+                        warn!("{} {} Cannot flatten hedge — no price data yet",
+                            "[INIT]".cyan().bold(), "⚠".yellow().bold());
+                    }
+                }
+
+                // Verify
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let maker_pos2 = maker_exchange.get_positions(Some(&maker_symbol)).await
+                    .ok().and_then(|ps| ps.first().map(|p| p.signed_amount())).unwrap_or(0.0);
+                let hedge_pos2 = hyperliquid_trading.get_user_state(&hl_wallet).await.ok()
+                    .and_then(|us| us.asset_positions.iter()
+                        .find(|ap| ap.position.coin == hedge_symbol)
+                        .and_then(|ap| ap.position.szi.parse::<f64>().ok()))
+                    .unwrap_or(0.0);
+                if maker_pos2.abs() < min_pos && hedge_pos2.abs() < min_pos {
+                    info!("{} {} Both sides flat after cleanup",
+                        "[INIT]".cyan().bold(), "✓".green().bold());
+                } else {
+                    warn!("{} {} Positions still remain: maker={:.4}, hedge={:.4}",
+                        "[INIT]".cyan().bold(), "⚠".yellow().bold(), maker_pos2, hedge_pos2);
+                }
+            } else {
+                info!("{} {} No residual positions (maker={:.4}, hedge={:.4})",
+                    "[INIT]".cyan().bold(), "✓".green().bold(), maker_pos, hedge_pos);
+            }
+        }
+
         // Get maker symbol info to determine tick size
         let maker_symbol_info = maker_exchange
             .get_symbol_info(&maker_symbol)
@@ -509,7 +601,9 @@ impl XemmBot {
     }
 
     /// Close a specific size of position in a given direction.
-    /// Used for partial closes (event-only or carry-only) without touching the other side.
+    ///
+    /// `use_market`: true for emergency (market orders both sides),
+    ///               false for normal (maker limit on both sides, fallback to market on timeout).
     async fn close_partial_position(
         &self,
         maker_symbol: &str,
@@ -520,28 +614,21 @@ impl XemmBot {
         pac_ask: f64,
         hl_bid: f64,
         hl_ask: f64,
+        use_market: bool,
     ) -> anyhow::Result<()> {
         if size < self.config.exit_rebalance_min_abs_position {
             return Ok(());
         }
 
-        // Determine order sides based on direction
         let (maker_side, hl_is_buy) = match direction {
-            CarryDirection::ShortMakerLongHedge => {
-                // We are SHORT maker + LONG hedge → close by BUY maker + SELL hedge
-                (MakerOrderSide::Buy, false)
-            }
-            CarryDirection::LongMakerShortHedge => {
-                // We are LONG maker + SHORT hedge → close by SELL maker + BUY hedge
-                (MakerOrderSide::Sell, true)
-            }
+            CarryDirection::ShortMakerLongHedge => (MakerOrderSide::Buy, false),
+            CarryDirection::LongMakerShortHedge => (MakerOrderSide::Sell, true),
         };
 
+        let order_type = if use_market { "MARKET" } else { "LIMIT" };
         info!(
-            "[PARTIAL_CLOSE] Closing {:.4} units {:?} | maker {} + hedge {}",
-            size,
-            direction,
-            maker_side.as_str(),
+            "[PARTIAL_CLOSE] Closing {:.4} units {:?} via {} | maker {} + hedge {}",
+            size, direction, order_type, maker_side.as_str(),
             if hl_is_buy { "BUY" } else { "SELL" }
         );
 
@@ -550,25 +637,86 @@ impl XemmBot {
             warn!("[PARTIAL_CLOSE] Failed to cancel maker orders: {}", e);
         }
 
-        // Close maker side
-        self.maker_exchange
-            .place_market_order(maker_symbol, maker_side, size, true)
-            .await
-            .with_context(|| format!("Failed maker partial close ({} {})", maker_side.as_str(), size))?;
+        if use_market {
+            // Emergency: market orders both sides
+            self.maker_exchange
+                .place_market_order(maker_symbol, maker_side, size, true)
+                .await
+                .with_context(|| format!("Failed maker market close ({} {})", maker_side.as_str(), size))?;
 
-        // Close hedge side
-        self.hyperliquid_trading
-            .place_market_order(
-                hedge_symbol,
-                hl_is_buy,
-                size,
-                self.config.hyperliquid_slippage,
-                true, // reduce_only
-                Some(hl_bid),
-                Some(hl_ask),
-            )
-            .await
-            .with_context(|| format!("Failed hedge partial close ({} {})", if hl_is_buy { "BUY" } else { "SELL" }, size))?;
+            self.hyperliquid_trading
+                .place_market_order(
+                    hedge_symbol, hl_is_buy, size,
+                    self.config.hyperliquid_slippage, true,
+                    Some(hl_bid), Some(hl_ask),
+                )
+                .await
+                .with_context(|| format!("Failed hedge market close"))?;
+        } else {
+            // Non-emergency: maker limit on maker side, then hedge
+            // Place maker limit order at best bid/ask (maker fee)
+            let maker_limit_price = match maker_side {
+                MakerOrderSide::Buy => pac_bid,   // BUY at bid = maker
+                MakerOrderSide::Sell => pac_ask,   // SELL at ask = maker
+            };
+
+            let timeout_secs = self.normal_mode.close_limit_timeout_secs.max(10);
+            info!("[PARTIAL_CLOSE] Maker limit {} {:.4} @ {:.4} (timeout {}s)",
+                maker_side.as_str(), size, maker_limit_price, timeout_secs);
+
+            match self.maker_exchange
+                .place_limit_order(maker_symbol, maker_side, size, maker_limit_price, Some(pac_bid), Some(pac_ask))
+                .await
+            {
+                Ok(_order) => {
+                    // Wait for fill with timeout
+                    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+                    let mut filled = false;
+                    while Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        // Check if order is still open
+                        match self.maker_exchange.get_open_orders(Some(maker_symbol)).await {
+                            Ok(orders) if orders.is_empty() => {
+                                filled = true;
+                                break;
+                            }
+                            Ok(_) => continue, // still open, wait
+                            Err(_) => continue,
+                        }
+                    }
+                    if !filled {
+                        warn!("[PARTIAL_CLOSE] Maker limit timed out, cancelling and using market");
+                        let _ = self.maker_exchange.cancel_all_orders(Some(maker_symbol)).await;
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        self.maker_exchange
+                            .place_market_order(maker_symbol, maker_side, size, true)
+                            .await
+                            .with_context(|| format!("Failed maker market fallback"))?;
+                    }
+                }
+                Err(e) => {
+                    warn!("[PARTIAL_CLOSE] Maker limit failed ({}), using market", e);
+                    self.maker_exchange
+                        .place_market_order(maker_symbol, maker_side, size, true)
+                        .await
+                        .with_context(|| format!("Failed maker market fallback"))?;
+                }
+            }
+
+            // Hedge side: also try limit for lower fees
+            // HL maker fee is ~1 bps vs 4 bps taker
+            let hl_limit_price = if hl_is_buy { hl_ask } else { hl_bid };
+            // For simplicity, use market on HL for now (HL limit orders need different API)
+            // TODO: implement HL limit close when API supports it
+            self.hyperliquid_trading
+                .place_market_order(
+                    hedge_symbol, hl_is_buy, size,
+                    self.config.hyperliquid_slippage, true,
+                    Some(hl_bid), Some(hl_ask),
+                )
+                .await
+                .with_context(|| format!("Failed hedge close"))?;
+        }
 
         info!("[PARTIAL_CLOSE] Successfully closed {:.4} units", size);
         Ok(())
@@ -1120,6 +1268,7 @@ impl XemmBot {
                                                 &maker_symbol, &hedge_symbol,
                                                 ep.size, ep.direction,
                                                 pac_bid, pac_ask, hl_bid, hl_ask,
+                                                false, // non-emergency: use maker limit
                                             ).await
                                         } else {
                                             Ok(()) // No event position to close
@@ -1287,11 +1436,12 @@ impl XemmBot {
                                     abs_mid_spread_bps,
                                 ).await.map(|_| ())
                             } else if let Some((size, dir)) = close_size_and_dir {
-                                // Normal close: only close carry portion
+                                // Normal close: only close carry portion (maker limit for lower fees)
                                 self.close_partial_position(
                                     &maker_symbol, &hedge_symbol,
                                     size, dir,
                                     pac_bid, pac_ask, hl_bid, hl_ask,
+                                    use_market, // true for emergency, false for normal
                                 ).await
                             } else {
                                 Ok(())
