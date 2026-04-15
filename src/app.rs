@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::audit_logger;
 use crate::bot::{ActiveOrder, BotState, BotStatus};
@@ -33,6 +33,8 @@ use crate::services::{
     HedgeEvent,
 };
 use crate::strategy::{EntryProfile, OpportunityEvaluator, OrderSide, RegimeController, RegimeSettings};
+use crate::strategy::funding::{FundingCarryTracker, FundingSnapshot};
+use crate::strategy::spread_stats::SpreadStats;
 use crate::util::api_health::BinanceApiHealth;
 use crate::util::rate_limit::{is_rate_limit_error, parse_ban_until_ms, RateLimitTracker};
 
@@ -458,6 +460,67 @@ impl XemmBot {
         Ok((maker_signed, hedge_signed))
     }
 
+    /// Fetch funding rate snapshot from both exchanges.
+    async fn fetch_funding_snapshot(
+        &self,
+        maker_symbol: &str,
+        hedge_symbol: &str,
+    ) -> anyhow::Result<FundingSnapshot> {
+        // Binance: only works for Binance maker
+        let maker_rate;
+        let maker_secs_to_settle;
+
+        if matches!(self.maker_kind, MakerExchangeKind::Binance) {
+            if let Ok(idx) = self
+                .maker_exchange
+                .as_any()
+                .downcast_ref::<crate::connector::maker::BinanceMakerExchange>()
+                .ok_or_else(|| anyhow::anyhow!("not BinanceMakerExchange"))
+                .and_then(|bme| {
+                    // We need access to the inner BinanceTrading. For now, use a direct API call.
+                    Err(anyhow::anyhow!("downcast not available"))
+                })
+            {
+                let _ = idx; // unreachable
+            }
+            // Fallback: use a separate HTTP call since we can't easily downcast the trait
+            let client = reqwest::Client::new();
+            let url = format!(
+                "https://fapi.binance.com/fapi/v1/premiumIndex?symbol={}",
+                maker_symbol
+            );
+            let resp = client.get(&url).send().await?;
+            let text = resp.text().await?;
+            let idx: crate::connector::binance::BinancePremiumIndex =
+                serde_json::from_str(&text)?;
+            maker_rate = idx.last_funding_rate.parse::<f64>().unwrap_or(0.0);
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis() as u64;
+            maker_secs_to_settle = idx.next_funding_time.saturating_sub(now_ms) / 1000;
+        } else {
+            maker_rate = 0.0;
+            maker_secs_to_settle = u64::MAX;
+        }
+
+        // Hyperliquid
+        let hedge_rate_hourly = match self
+            .hyperliquid_trading
+            .get_latest_funding_rate(hedge_symbol)
+            .await
+        {
+            Ok(Some(entry)) => entry.funding_rate.parse::<f64>().unwrap_or(0.0),
+            _ => 0.0,
+        };
+
+        Ok(FundingSnapshot {
+            maker_rate,
+            maker_secs_to_settle,
+            hedge_rate_hourly,
+            captured_at: Instant::now(),
+        })
+    }
+
     async fn trigger_exit_rebalance(
         &self,
         maker_symbol: &str,
@@ -814,6 +877,9 @@ impl XemmBot {
         let mut order_placement_rate_limit = RateLimitTracker::new();
         let mut next_order_attempt_allowed_at = Instant::now();
         let mut last_health_warn = Instant::now() - Duration::from_secs(60);
+        let mut spread_stats = SpreadStats::new(self.normal_mode.spread_window_secs);
+        let mut funding_tracker = FundingCarryTracker::new(24);
+        let mut last_funding_poll = Instant::now() - Duration::from_secs(600); // poll immediately on start
         let mut exit_rebalance_below_threshold_since: Option<Instant> = None;
         let mut next_exit_rebalance_allowed_at = Instant::now();
         let mut last_event_active = false;
@@ -916,6 +982,24 @@ impl XemmBot {
                     let mid_spread_bps = ((pac_mid - hl_mid) / hl_mid) * 10000.0;
                     let abs_mid_spread_bps = mid_spread_bps.abs();
                     let hl_spread_bps = ((hl_ask - hl_bid) / hl_mid) * 10000.0;
+
+                    // Update rolling spread statistics for Z-score entry
+                    let now_ms_sys = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as i64;
+                    spread_stats.push(now_ms_sys, mid_spread_bps);
+
+                    // Periodic funding rate poll
+                    if last_funding_poll.elapsed() >= Duration::from_secs(self.normal_mode.funding_poll_interval_secs) {
+                        last_funding_poll = Instant::now();
+                        // Fire and forget — don't block the eval loop
+                        if let Ok(snap) = self.fetch_funding_snapshot(&maker_symbol, &hedge_symbol).await {
+                            let net = funding_tracker.update(snap);
+                            debug!("[FUNDING] Net carry: {:+.1} bps/8h", net);
+                        }
+                    }
+
                     let regime_decision =
                         regime.update(Instant::now(), mid_spread_bps, hl_spread_bps.max(0.0));
                     if regime_decision.event_active && !last_event_active {
@@ -1039,6 +1123,68 @@ impl XemmBot {
                         }
                     }
 
+                    // --- Normal carry position management ---
+                    // Check if we should close an existing carry position
+                    if !regime_decision.event_active {
+                        let should_close = {
+                            let state = self.bot_state.read().await;
+                            if let Some(ref pos) = state.normal_position {
+                                let spread_loss = pos.entry_spread_bps - mid_spread_bps;
+                                let hold_hours = pos.entry_time.elapsed().as_secs() / 3600;
+                                let carry_adverse = funding_tracker.consecutive_adverse(
+                                    self.normal_mode.funding_adverse_threshold_bps as f64,
+                                ) >= self.normal_mode.funding_adverse_consecutive as usize;
+                                let spread_narrowed = abs_mid_spread_bps < self.normal_mode.close_spread_bps;
+                                let stop_loss = spread_loss > self.normal_mode.max_loss_bps;
+                                let max_hold = hold_hours >= self.normal_mode.max_hold_hours;
+                                let funding_jumped = funding_tracker.hedge_rate_jumped(0.0005);
+
+                                if funding_jumped {
+                                    Some("funding_rate_jump")
+                                } else if stop_loss {
+                                    Some("stop_loss")
+                                } else if carry_adverse {
+                                    Some("carry_adverse")
+                                } else if spread_narrowed {
+                                    Some("spread_narrowed")
+                                } else if max_hold {
+                                    Some("max_hold_time")
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some(reason) = should_close {
+                            let use_market = matches!(reason, "funding_rate_jump" | "stop_loss");
+                            info!(
+                                "[CARRY] Closing normal position: {} (market={})",
+                                reason, use_market
+                            );
+                            match self
+                                .trigger_exit_rebalance(
+                                    &maker_symbol, &hedge_symbol,
+                                    pac_bid, pac_ask, hl_bid, hl_ask,
+                                    abs_mid_spread_bps,
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    let mut state = self.bot_state.write().await;
+                                    state.normal_position = None;
+                                    info!("[CARRY] Position closed successfully");
+                                }
+                                Err(e) => {
+                                    warn!("[CARRY] Failed to close position: {}", e);
+                                }
+                            }
+                            next_order_attempt_allowed_at = Instant::now() + Duration::from_secs(3);
+                            continue;
+                        }
+                    }
+
                     if regime_decision.suppress_entries {
                         continue;
                     }
@@ -1071,6 +1217,26 @@ impl XemmBot {
                     };
 
                     let best_opp = OpportunityEvaluator::pick_best_opportunity(buy_opp, sell_opp, pac_mid);
+
+                    // Normal mode: gate entry on Z-score and max position
+                    if best_opp.is_some() && matches!(regime_decision.profile, EntryProfile::Normal) {
+                        let z = spread_stats.z_score(mid_spread_bps);
+                        let current_pos = {
+                            let state = self.bot_state.read().await;
+                            state.normal_position.as_ref().map(|p| p.size).unwrap_or(0.0)
+                        };
+                        if self.normal_mode.entry_z_score > 0.0
+                            && (z < self.normal_mode.entry_z_score
+                                || !spread_stats.is_ready(60))
+                        {
+                            // Spread not spiked enough — skip entry, wait for better price
+                            continue;
+                        }
+                        if current_pos >= self.normal_mode.max_position_units {
+                            // Already at max carry position — don't add more
+                            continue;
+                        }
+                    }
 
                     if let Some(opp) = best_opp {
                         // Double-check bot is still idle
@@ -1206,6 +1372,28 @@ impl XemmBot {
                                         active_profile.profit_cancel_threshold_bps,
                                         active_profile.order_refresh_interval_secs,
                                     );
+
+                                    // Track carry position in normal mode
+                                    if matches!(regime_decision.profile, EntryProfile::Normal) {
+                                        let prev_size = state.normal_position.as_ref().map(|p| p.size).unwrap_or(0.0);
+                                        if state.normal_position.is_none() {
+                                            state.normal_position = Some(crate::bot::NormalModePosition {
+                                                entry_spread_bps: mid_spread_bps,
+                                                entry_time: placed_at,
+                                                size: opp.size,
+                                            });
+                                        } else if let Some(ref mut pos) = state.normal_position {
+                                            // Add to existing position (weighted average entry spread)
+                                            let total = pos.size + opp.size;
+                                            pos.entry_spread_bps = (pos.entry_spread_bps * pos.size + mid_spread_bps * opp.size) / total;
+                                            pos.size = total;
+                                        }
+                                        info!("[CARRY] Position updated: {:.4} units (was {:.4}), entry_spread={:.1} bps",
+                                            state.normal_position.as_ref().map(|p| p.size).unwrap_or(0.0),
+                                            prev_size,
+                                            state.normal_position.as_ref().map(|p| p.entry_spread_bps).unwrap_or(0.0)
+                                        );
+                                    }
                                 } else {
                                     if self.config.order_failure_cooldown_ms > 0 {
                                         next_order_attempt_allowed_at = Instant::now()
